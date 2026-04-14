@@ -99,11 +99,12 @@ io.on('connection', (socket) => {
   });
 
   // Media state updates
-  socket.on('media-state', ({ roomId, video, audio }) => {
+  socket.on('media-state', ({ roomId, video, audio, screen }) => {
     socket.to(roomId).emit('peer-media-state', {
       socketId: socket.id,
       video,
-      audio
+      audio,
+      screen  // FIX: was missing — remote peers never knew screenshare started
     });
   });
 
