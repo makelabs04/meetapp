@@ -27,7 +27,7 @@ app.get('/room/:roomId', (req, res) => {
 
 app.post('/create-room', (req, res) => {
   const roomId = uuidv4().substring(0, 8);
-  rooms[roomId] = { participants: [], createdAt: Date.now() };
+  rooms[roomId] = { participants: [], host: null, createdAt: Date.now() };
   res.json({ roomId });
 });
 
@@ -40,39 +40,43 @@ app.get('/api/room/:roomId', (req, res) => {
   }
 });
 
-// Socket.io signaling
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
 
   socket.on('join-room', ({ roomId, userName }) => {
     if (!rooms[roomId]) {
-      rooms[roomId] = { participants: [], createdAt: Date.now() };
+      rooms[roomId] = { participants: [], host: null, createdAt: Date.now() };
     }
 
     const room = rooms[roomId];
 
-    // Check if already in room
+    // First person to join becomes the host
+    const isHost = room.participants.length === 0;
+    if (isHost) {
+      room.host = socket.id;
+    }
+
     if (!room.participants.find(p => p.socketId === socket.id)) {
-      room.participants.push({ socketId: socket.id, userName });
+      room.participants.push({ socketId: socket.id, userName, isHost, video: true, audio: true });
     }
 
     socket.join(roomId);
     socket.roomId = roomId;
     socket.userName = userName;
 
-    // Tell existing users about new peer
     socket.to(roomId).emit('user-joined', {
       socketId: socket.id,
       userName,
       participants: room.participants
     });
 
-    // Send existing participants to new user
     socket.emit('room-users', {
-      participants: room.participants.filter(p => p.socketId !== socket.id)
+      participants: room.participants.filter(p => p.socketId !== socket.id),
+      hostSocketId: room.host,
+      isHost
     });
 
-    console.log(`${userName} joined room ${roomId}. Participants: ${room.participants.length}`);
+    console.log(`${userName} joined room ${roomId}. Host: ${room.host}. Participants: ${room.participants.length}`);
   });
 
   // WebRTC signaling relay
@@ -104,18 +108,57 @@ io.on('connection', (socket) => {
       socketId: socket.id,
       video,
       audio,
-      screen  // FIX: was missing — remote peers never knew screenshare started
+      screen
     });
+
+    // Update participant media state in room store
+    const room = rooms[roomId];
+    if (room) {
+      const p = room.participants.find(p => p.socketId === socket.id);
+      if (p) { p.video = video; p.audio = audio; p.screen = screen; }
+      // Notify host of updated states
+      if (room.host) {
+        io.to(room.host).emit('participants-updated', { participants: room.participants });
+      }
+    }
+  });
+
+  // ── HOST CONTROLS ──────────────────────────────────────────
+  socket.on('host-mute-mic', ({ roomId, targetSocketId, mute }) => {
+    const room = rooms[roomId];
+    if (!room || room.host !== socket.id) return;
+    io.to(targetSocketId).emit('remote-mute-mic', { mute, byHost: true });
+  });
+
+  socket.on('host-mute-cam', ({ roomId, targetSocketId, mute }) => {
+    const room = rooms[roomId];
+    if (!room || room.host !== socket.id) return;
+    io.to(targetSocketId).emit('remote-mute-cam', { mute, byHost: true });
+  });
+
+  socket.on('host-kick', ({ roomId, targetSocketId }) => {
+    const room = rooms[roomId];
+    if (!room || room.host !== socket.id) return;
+    io.to(targetSocketId).emit('kicked-from-room', {});
   });
 
   // Disconnect
   socket.on('disconnect', () => {
     const roomId = socket.roomId;
     if (roomId && rooms[roomId]) {
+      const wasHost = rooms[roomId].host === socket.id;
       rooms[roomId].participants = rooms[roomId].participants.filter(
         p => p.socketId !== socket.id
       );
       socket.to(roomId).emit('user-left', { socketId: socket.id, userName: socket.userName });
+
+      if (wasHost && rooms[roomId].participants.length > 0) {
+        const newHost = rooms[roomId].participants[0];
+        rooms[roomId].host = newHost.socketId;
+        newHost.isHost = true;
+        io.to(newHost.socketId).emit('you-are-now-host', {});
+        socket.to(roomId).emit('host-changed', { hostSocketId: newHost.socketId });
+      }
 
       if (rooms[roomId].participants.length === 0) {
         delete rooms[roomId];
@@ -126,7 +169,6 @@ io.on('connection', (socket) => {
   });
 });
 
-// Clean up old empty rooms every 30 minutes
 setInterval(() => {
   const now = Date.now();
   Object.keys(rooms).forEach(roomId => {
