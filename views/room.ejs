@@ -89,6 +89,12 @@
         <span>Camera</span>
       </button>
 
+      <button class="ctrl-btn" id="screen-btn" onclick="toggleScreenShare()" title="Share screen">
+        <svg class="icon-on" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+        <svg class="icon-off hidden" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+        <span>Share</span>
+      </button>
+
       <button class="ctrl-btn chat-toggle-btn" onclick="toggleChat()" title="Toggle chat" id="chat-btn">
         <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
         <span>Chat</span>
@@ -106,6 +112,20 @@
         Share
       </button>
     </div>
+  </div>
+
+  <!-- Screen Share Banner -->
+  <div class="screen-banner hidden" id="screen-banner">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+    You are presenting your screen
+    <button onclick="stopScreenShare()">Stop sharing</button>
+  </div>
+
+  <!-- Audio Unlock Banner (shown when autoplay is blocked) -->
+  <div class="audio-banner hidden" id="audio-banner">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 1a4 4 0 014 4v6a4 4 0 01-8 0V5a4 4 0 014-4zm-1 15.93V20H9v2h6v-2h-2v-3.07A7.001 7.001 0 0019 11h-2a5 5 0 01-10 0H5a7.001 7.001 0 006 6.93z"/></svg>
+    Audio is muted by your browser.
+    <button onclick="forceUnlockAudio()">Click to Enable Audio</button>
   </div>
 
   <!-- Toast -->

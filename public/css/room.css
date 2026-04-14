@@ -281,6 +281,77 @@ html, body {
 }
 .ctrl-btn-sm:hover { color: var(--text); border-color: rgba(255,255,255,0.15); }
 
+/* SCREEN SHARE BANNER */
+.screen-banner {
+  position: fixed; top: calc(var(--top-bar) + 12px); left: 50%;
+  transform: translateX(-50%);
+  background: rgba(99,102,241,0.15);
+  border: 1px solid rgba(99,102,241,0.45);
+  color: #c7d2fe;
+  padding: 10px 16px;
+  border-radius: 100px;
+  font-size: 13px;
+  display: flex; align-items: center; gap: 10px;
+  z-index: 200;
+  white-space: nowrap;
+  backdrop-filter: blur(10px);
+  animation: fadeIn 0.3s ease;
+}
+.screen-banner.hidden { display: none; }
+.screen-banner button {
+  background: rgba(99,102,241,0.3);
+  border: 1px solid rgba(99,102,241,0.5);
+  color: #e0e7ff;
+  padding: 5px 14px;
+  border-radius: 100px;
+  cursor: pointer;
+  font-family: 'DM Sans', sans-serif;
+  font-size: 13px; font-weight: 600;
+  transition: background 0.15s;
+}
+.screen-banner button:hover { background: rgba(239,68,68,0.3); border-color: rgba(239,68,68,0.5); color: #fca5a5; }
+
+/* Screenshare tile gets a blue glow border */
+.video-tile.screenshare-tile { border-color: #6366f1; box-shadow: 0 0 0 2px rgba(99,102,241,0.4); }
+.screenshare-label {
+  position: absolute; top: 8px; left: 10px;
+  background: rgba(99,102,241,0.85);
+  color: white; font-size: 11px; font-weight: 600;
+  padding: 3px 10px; border-radius: 100px;
+  letter-spacing: 0.03em;
+}
+
+/* AUDIO UNLOCK BANNER */
+.audio-banner {
+  position: fixed; top: calc(var(--top-bar) + 12px); left: 50%;
+  transform: translateX(-50%);
+  background: rgba(234,179,8,0.15);
+  border: 1px solid rgba(234,179,8,0.4);
+  color: #fde68a;
+  padding: 10px 16px;
+  border-radius: 100px;
+  font-size: 13px;
+  display: flex; align-items: center; gap: 10px;
+  z-index: 200;
+  white-space: nowrap;
+  backdrop-filter: blur(10px);
+  animation: fadeIn 0.3s ease;
+}
+.audio-banner.hidden { display: none; }
+.audio-banner button {
+  background: rgba(234,179,8,0.25);
+  border: 1px solid rgba(234,179,8,0.5);
+  color: #fef3c7;
+  padding: 5px 14px;
+  border-radius: 100px;
+  cursor: pointer;
+  font-family: 'DM Sans', sans-serif;
+  font-size: 13px; font-weight: 600;
+  transition: background 0.15s;
+}
+.audio-banner button:hover { background: rgba(234,179,8,0.4); }
+@keyframes fadeIn { from { opacity:0; transform: translateX(-50%) translateY(-8px); } to { opacity:1; transform: translateX(-50%) translateY(0); } }
+
 /* TOAST */
 .toast {
   position: fixed; bottom: 100px; left: 50%; transform: translateX(-50%);
