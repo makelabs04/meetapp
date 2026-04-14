@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>MeetSpace — Video Conferencing</title>
+  <link rel="stylesheet" href="/css/style.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Clash+Display:wght@400;600;700&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+</head>
+<body class="home-body">
+  <div class="home-bg">
+    <div class="blob blob-1"></div>
+    <div class="blob blob-2"></div>
+    <div class="blob blob-3"></div>
+    <div class="grid-overlay"></div>
+  </div>
+
+  <header class="home-header">
+    <div class="logo">
+      <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+        <circle cx="16" cy="16" r="16" fill="url(#lg)"/>
+        <path d="M9 12h9a3 3 0 013 3v5H12a3 3 0 01-3-3v-5z" fill="white" opacity="0.9"/>
+        <path d="M21 14l5-3v10l-5-3v-4z" fill="white"/>
+        <defs>
+          <linearGradient id="lg" x1="0" y1="0" x2="32" y2="32">
+            <stop stop-color="#6366f1"/>
+            <stop offset="1" stop-color="#8b5cf6"/>
+          </linearGradient>
+        </defs>
+      </svg>
+      <span>MeetSpace</span>
+    </div>
+  </header>
+
+  <main class="home-main">
+    <div class="hero-text">
+      <p class="hero-badge">✦ Free &amp; Secure Video Calls</p>
+      <h1>Meet anyone,<br/><span class="gradient-text">anywhere.</span></h1>
+      <p class="hero-sub">Crystal-clear video conferencing with no downloads, no limits. Start or join in seconds.</p>
+    </div>
+
+    <div class="action-card">
+      <div class="tab-bar">
+        <button class="tab active" id="tab-new" onclick="switchTab('new')">New Meeting</button>
+        <button class="tab" id="tab-join" onclick="switchTab('join')">Join Meeting</button>
+      </div>
+
+      <div class="tab-content" id="content-new">
+        <div class="input-group">
+          <label>Your Name</label>
+          <input type="text" id="new-name" placeholder="Enter your name" maxlength="30"/>
+        </div>
+        <button class="btn-primary" onclick="createRoom()">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 10l4.553-2.069A1 1 0 0121 8.87v6.26a1 1 0 01-1.447.9L15 14M3 8a2 2 0 012-2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z"/></svg>
+          Start New Meeting
+        </button>
+      </div>
+
+      <div class="tab-content hidden" id="content-join">
+        <div class="input-group">
+          <label>Your Name</label>
+          <input type="text" id="join-name" placeholder="Enter your name" maxlength="30"/>
+        </div>
+        <div class="input-group">
+          <label>Meeting Code</label>
+          <input type="text" id="room-code" placeholder="Enter meeting code" maxlength="8"/>
+        </div>
+        <button class="btn-primary" onclick="joinRoom()">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 012 2v14a2 2 0 01-2 2h-4M10 17l5-5-5-5M13 12H3"/></svg>
+          Join Meeting
+        </button>
+      </div>
+
+      <p class="error-msg" id="error-msg"></p>
+    </div>
+
+    <div class="features">
+      <div class="feature-chip">🔒 End-to-End Encrypted</div>
+      <div class="feature-chip">📱 Mobile Friendly</div>
+      <div class="feature-chip">💬 Built-in Chat</div>
+      <div class="feature-chip">🎤 Mute Controls</div>
+    </div>
+  </main>
+
+  <script>
+    function switchTab(tab) {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
+      document.getElementById('tab-' + tab).classList.add('active');
+      document.getElementById('content-' + tab).classList.remove('hidden');
+      document.getElementById('error-msg').textContent = '';
+    }
+
+    async function createRoom() {
+      const name = document.getElementById('new-name').value.trim();
+      if (!name) { showError('Please enter your name'); return; }
+
+      const btn = document.querySelector('#content-new .btn-primary');
+      btn.textContent = 'Creating...';
+      btn.disabled = true;
+
+      try {
+        const res = await fetch('/create-room', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+        const { roomId } = await res.json();
+        sessionStorage.setItem('userName', name);
+        window.location.href = `/room/${roomId}`;
+      } catch (e) {
+        showError('Could not create room. Try again.');
+        btn.disabled = false;
+        btn.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 10l4.553-2.069A1 1 0 0121 8.87v6.26a1 1 0 01-1.447.9L15 14M3 8a2 2 0 012-2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z"/></svg>Start New Meeting';
+      }
+    }
+
+    async function joinRoom() {
+      const name = document.getElementById('join-name').value.trim();
+      const code = document.getElementById('room-code').value.trim().toLowerCase();
+      if (!name) { showError('Please enter your name'); return; }
+      if (!code) { showError('Please enter a meeting code'); return; }
+
+      const res = await fetch(`/api/room/${code}`);
+      const data = await res.json();
+      if (!data.exists) { showError('Meeting not found. Check the code and try again.'); return; }
+
+      sessionStorage.setItem('userName', name);
+      window.location.href = `/room/${code}`;
+    }
+
+    function showError(msg) {
+      const el = document.getElementById('error-msg');
+      el.textContent = msg;
+      el.style.animation = 'none';
+      el.offsetHeight;
+      el.style.animation = 'shake 0.4s ease';
+    }
+
+    // Enter key support
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Enter') {
+        const active = document.querySelector('.tab.active').id;
+        if (active === 'tab-new') createRoom();
+        else joinRoom();
+      }
+    });
+  </script>
+</body>
+</html>
