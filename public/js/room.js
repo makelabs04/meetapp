@@ -1,11 +1,11 @@
 // ============================================================
-//  MeetSpace - Room Client  (Fixed: audio + screenshare + pip)
+//  MeetSpace - Room Client  (Fixed: screenshare + pip + min/max for all)
 // ============================================================
 
 const socket = io();
-const peers       = {};   // socketId -> RTCPeerConnection
-const peerStreams  = {};   // socketId -> MediaStream
-const peerNames   = {};   // socketId -> userName
+const peers       = {};
+const peerStreams  = {};
+const peerNames   = {};
 
 let localStream     = null;
 let screenStream    = null;
@@ -17,6 +17,7 @@ let chatOpen    = false;
 let unreadCount = 0;
 let startTime   = Date.now();
 let audioUnlocked = false;
+let localMinimized = false;
 
 const ICE_SERVERS = {
   iceServers: [
@@ -28,7 +29,6 @@ const ICE_SERVERS = {
   ]
 };
 
-// ── DOM refs ──────────────────────────────────────────────────
 const videoGrid        = document.getElementById('video-grid');
 const localVideo       = document.getElementById('local-video');
 const localPlaceholder = document.getElementById('local-placeholder');
@@ -42,20 +42,17 @@ const participantCount = document.getElementById('participant-count');
 const screenPreview    = document.getElementById('screen-preview');
 const screenPreviewVid = document.getElementById('screen-preview-video');
 
-// ── Autoplay unlock ───────────────────────────────────────────
 function unlockAudio() {
   if (audioUnlocked) return;
   audioUnlocked = true;
   document.querySelectorAll('.video-tile:not(.local-tile) video').forEach(v => {
-    v.muted = false;
-    v.volume = 1.0;
+    v.muted = false; v.volume = 1.0;
     if (v.srcObject) v.play().catch(() => {});
   });
 }
 document.addEventListener('click',   unlockAudio);
 document.addEventListener('keydown', unlockAudio);
 
-// ── Init ──────────────────────────────────────────────────────
 document.getElementById('display-room-id').textContent = ROOM_ID;
 localNameLabel.textContent = USER_NAME + ' (You)';
 localAvatar.textContent    = USER_NAME.charAt(0).toUpperCase();
@@ -67,11 +64,8 @@ async function init() {
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
     });
     localVideo.srcObject = localStream;
-    localVideo.muted = true;  // always mute self-view to prevent echo
+    localVideo.muted = true;
     localPlaceholder.classList.add('hidden');
-
-    const aTracks = localStream.getAudioTracks();
-    console.log('[init] audio tracks:', aTracks.length, aTracks.map(t => t.label));
   } catch (err) {
     console.error('[init] getUserMedia error:', err.name, err.message);
     try {
@@ -79,8 +73,7 @@ async function init() {
       camEnabled = false;
       showToast('Camera unavailable — audio only');
     } catch (e2) {
-      micEnabled = false;
-      camEnabled = false;
+      micEnabled = false; camEnabled = false;
       showToast('No camera/mic — joining as viewer');
     }
     syncBtnUI();
@@ -89,7 +82,6 @@ async function init() {
   updateGridLayout();
 }
 
-// ── Socket events ─────────────────────────────────────────────
 socket.on('room-users', async ({ participants }) => {
   for (const p of participants) {
     if (!peers[p.socketId]) {
@@ -149,7 +141,7 @@ socket.on('peer-media-state', ({ socketId, video, audio, screen }) => {
   if (!tile) return;
   const micIcon = tile.querySelector('.tile-icon');
   if (micIcon) micIcon.className = 'tile-icon ' + (audio ? 'mic-on' : 'mic-off');
-  const ph  = tile.querySelector('.no-video-placeholder');
+  const ph = tile.querySelector('.no-video-placeholder');
   if (ph) ph.classList.toggle('hidden', !!(video || screen));
   let label = tile.querySelector('.screenshare-label');
   if (screen) {
@@ -166,17 +158,25 @@ socket.on('peer-media-state', ({ socketId, video, audio, screen }) => {
   }
 });
 
-// ── Create peer connection ────────────────────────────────────
 async function createPeer(socketId, initiator) {
   const pc = new RTCPeerConnection(ICE_SERVERS);
   peers[socketId] = pc;
 
-  // Add local tracks (both audio + video)
   if (localStream) {
-    localStream.getTracks().forEach(track => {
-      pc.addTrack(track, localStream);
-      console.log(`[peer ${socketId}] added local ${track.kind}`);
-    });
+    localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+  }
+
+  // If already screen sharing, send screen track to new peer immediately
+  if (isScreenSharing && screenStream) {
+    const screenTrack = screenStream.getVideoTracks()[0];
+    if (screenTrack) {
+      const videoSender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+      if (videoSender) {
+        videoSender.replaceTrack(screenTrack).catch(e => console.warn('[new peer screen replaceTrack]', e));
+      } else {
+        pc.addTrack(screenTrack, screenStream);
+      }
+    }
   }
 
   pc.onicecandidate = ({ candidate }) => {
@@ -188,14 +188,12 @@ async function createPeer(socketId, initiator) {
     if (['disconnected','failed','closed'].includes(pc.connectionState)) removePeer(socketId);
   };
 
-  // Build one MediaStream per peer; ontrack fires per-track
   peerStreams[socketId] = new MediaStream();
 
   pc.ontrack = ({ track }) => {
-    console.log(`[peer ${socketId}] received ${track.kind} track`);
+    console.log(`[peer ${socketId}] received ${track.kind} track, id=${track.id}`);
     const stream = peerStreams[socketId];
 
-    // Remove old track of same kind first
     stream.getTracks().filter(t => t.kind === track.kind).forEach(t => stream.removeTrack(t));
     stream.addTrack(track);
     if (track.kind === 'audio') track.enabled = true;
@@ -204,6 +202,8 @@ async function createPeer(socketId, initiator) {
     if (tile) {
       const vid = tile.querySelector('video');
       if (vid) {
+        // KEY FIX: null then reassign forces browser to re-render with new track
+        vid.srcObject = null;
         vid.srcObject = stream;
         vid.muted  = false;
         vid.volume = 1.0;
@@ -241,7 +241,6 @@ function removePeer(socketId) {
   updateParticipantCount();
 }
 
-// ── Remote tile ───────────────────────────────────────────────
 function addRemoteTile(socketId, stream) {
   if (document.getElementById(`tile-${socketId}`)) return;
   const name    = peerNames[socketId] || 'Participant';
@@ -252,13 +251,19 @@ function addRemoteTile(socketId, stream) {
   tile.id = `tile-${socketId}`;
   tile.innerHTML = `
     <video autoplay playsinline></video>
+    <div class="tile-controls">
+      <button class="tile-action-btn tile-action-min" onclick="minimizeTile('${socketId}')" title="Minimize">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="10" y1="14" x2="3" y2="21"/><line x1="21" y1="3" x2="14" y2="10"/></svg>
+      </button>
+      <button class="tile-action-btn tile-action-max hidden" onclick="maximizeTile('${socketId}')" title="Maximize">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+      </button>
+    </div>
     <div class="tile-info">
       <div class="tile-name">${escapeHtml(name)}</div>
       <div class="tile-icons">
         <span class="tile-icon mic-on">
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
-            <path d="M12 1a4 4 0 014 4v6a4 4 0 01-8 0V5a4 4 0 014-4zm-1 15.93V20H9v2h6v-2h-2v-3.07A7.001 7.001 0 0019 11h-2a5 5 0 01-10 0H5a7.001 7.001 0 006 6.93z"/>
-          </svg>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 1a4 4 0 014 4v6a4 4 0 01-8 0V5a4 4 0 014-4zm-1 15.93V20H9v2h6v-2h-2v-3.07A7.001 7.001 0 0019 11h-2a5 5 0 01-10 0H5a7.001 7.001 0 006 6.93z"/></svg>
         </span>
       </div>
     </div>
@@ -279,7 +284,33 @@ function addRemoteTile(socketId, stream) {
   updateGridLayout();
 }
 
-// ── safePlay ──────────────────────────────────────────────────
+function minimizeTile(socketId) {
+  const tile = document.getElementById(`tile-${socketId}`);
+  if (!tile) return;
+  tile.classList.add('tile-minimized');
+  tile.querySelector('.tile-action-min').classList.add('hidden');
+  tile.querySelector('.tile-action-max').classList.remove('hidden');
+  updateGridLayout();
+}
+
+function maximizeTile(socketId) {
+  const tile = document.getElementById(`tile-${socketId}`);
+  if (!tile) return;
+  tile.classList.remove('tile-minimized');
+  tile.querySelector('.tile-action-min').classList.remove('hidden');
+  tile.querySelector('.tile-action-max').classList.add('hidden');
+  updateGridLayout();
+}
+
+function toggleLocalTile() {
+  const tile = document.getElementById('local-tile');
+  localMinimized = !localMinimized;
+  tile.classList.toggle('tile-minimized', localMinimized);
+  document.getElementById('local-min-btn').classList.toggle('hidden', localMinimized);
+  document.getElementById('local-max-btn').classList.toggle('hidden', !localMinimized);
+  updateGridLayout();
+}
+
 function safePlay(videoEl) {
   videoEl.muted  = false;
   videoEl.volume = 1.0;
@@ -291,7 +322,6 @@ function safePlay(videoEl) {
   });
 }
 
-// ── Grid layout ───────────────────────────────────────────────
 function updateGridLayout() {
   const count = videoGrid.children.length;
   videoGrid.setAttribute('data-count', Math.min(count, 6));
@@ -302,7 +332,6 @@ function updateParticipantCount() {
   participantCount.textContent = n === 1 ? '1 participant' : `${n} participants`;
 }
 
-// ── Mic ───────────────────────────────────────────────────────
 function toggleMic() {
   if (!localStream) return;
   micEnabled = !micEnabled;
@@ -312,7 +341,6 @@ function toggleMic() {
   socket.emit('media-state', { roomId: ROOM_ID, video: camEnabled, audio: micEnabled, screen: isScreenSharing });
 }
 
-// ── Camera ────────────────────────────────────────────────────
 function toggleCamera() {
   if (!localStream) return;
   camEnabled = !camEnabled;
@@ -337,7 +365,6 @@ function syncBtnUI() {
 }
 function updateButtons() { syncBtnUI(); }
 
-// ── Screen Share ──────────────────────────────────────────────
 async function toggleScreenShare() {
   isScreenSharing ? stopScreenShare() : await startScreenShare();
 }
@@ -357,37 +384,45 @@ async function startScreenShare() {
   screenMinimized   = false;
   const screenTrack = screenStream.getVideoTracks()[0];
 
-  // Replace video track in all peers
-  for (const socketId of Object.keys(peers)) {
-    const pc     = peers[socketId];
-    const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
-    if (sender) {
-      await sender.replaceTrack(screenTrack).catch(e => console.warn('[screen replaceTrack]', e.message));
+  // KEY FIX: Replace video sender track per peer; null+reassign srcObject on remote forces re-render
+  const replacePromises = Object.keys(peers).map(async (socketId) => {
+    const pc = peers[socketId];
+    const videoSender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+    if (videoSender) {
+      try {
+        await videoSender.replaceTrack(screenTrack);
+        console.log(`[screen] replaceTrack ok -> ${socketId}`);
+      } catch (e) {
+        console.warn(`[screen] replaceTrack failed -> ${socketId}, addTrack fallback`, e.message);
+        pc.addTrack(screenTrack, screenStream);
+      }
     } else {
       pc.addTrack(screenTrack, screenStream);
     }
-  }
+  });
+  await Promise.allSettled(replacePromises);
 
-  // PiP preview panel
+  // PiP — muted so you don't hear yourself
   screenPreviewVid.srcObject = screenStream;
+  screenPreviewVid.muted = true;
   screenPreviewVid.play().catch(() => {});
   screenPreview.classList.remove('hidden', 'minimized');
 
-  // Local tile shows screen
+  // Local tile — show screen, remove mirror (mirror looks wrong for screen content)
   localVideo.srcObject = screenStream;
+  localVideo.muted = true;
+  localVideo.style.transform = 'none';
   localPlaceholder.classList.add('hidden');
 
-  // Label on local tile
   const localTile = document.getElementById('local-tile');
   localTile.classList.add('screenshare-tile');
   if (!localTile.querySelector('.screenshare-label')) {
     const lbl = document.createElement('div');
-    lbl.className   = 'screenshare-label';
+    lbl.className = 'screenshare-label';
     lbl.textContent = '🖥 You are presenting';
     localTile.appendChild(lbl);
   }
 
-  // Btn UI
   const btn = document.getElementById('screen-btn');
   btn.classList.add('active');
   btn.querySelector('.icon-on').classList.add('hidden');
@@ -406,31 +441,29 @@ function stopScreenShare() {
 
   if (screenStream) { screenStream.getTracks().forEach(t => t.stop()); screenStream = null; }
 
-  // Restore camera track
   const camTrack = localStream ? localStream.getVideoTracks()[0] : null;
-  for (const socketId of Object.keys(peers)) {
-    const pc     = peers[socketId];
-    const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
-    if (sender) sender.replaceTrack(camTrack || null).catch(() => {});
-  }
+  Object.keys(peers).forEach(socketId => {
+    const pc = peers[socketId];
+    const videoSender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+    if (videoSender) {
+      videoSender.replaceTrack(camTrack || null).catch(e => console.warn('[stop screen replaceTrack]', e.message));
+    }
+  });
 
-  // Restore local video
   if (localStream) {
     localVideo.srcObject = localStream;
+    localVideo.style.transform = ''; // restore CSS class mirror
     localPlaceholder.classList.toggle('hidden', camEnabled);
   }
 
-  // Remove label
   const localTile = document.getElementById('local-tile');
   localTile.classList.remove('screenshare-tile');
   const lbl = localTile.querySelector('.screenshare-label');
   if (lbl) lbl.remove();
 
-  // Hide PiP
   screenPreview.classList.add('hidden');
   screenPreviewVid.srcObject = null;
 
-  // Btn UI
   const btn = document.getElementById('screen-btn');
   btn.classList.remove('active');
   btn.querySelector('.icon-on').classList.remove('hidden');
@@ -442,7 +475,6 @@ function stopScreenShare() {
   showToast('Screen sharing stopped');
 }
 
-// ── PiP minimize / maximize ───────────────────────────────────
 function toggleScreenPreview() {
   screenMinimized = !screenMinimized;
   screenPreview.classList.toggle('minimized', screenMinimized);
@@ -453,7 +485,6 @@ function toggleScreenPreview() {
     : `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="10" y1="14" x2="3" y2="21"/><line x1="21" y1="3" x2="14" y2="10"/></svg>`;
 }
 
-// ── Chat ──────────────────────────────────────────────────────
 function toggleChat() {
   chatOpen = !chatOpen;
   chatPanel.classList.toggle('open', chatOpen);
@@ -498,7 +529,6 @@ chatInput.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
 });
 
-// ── Audio unlock ──────────────────────────────────────────────
 function forceUnlockAudio() {
   document.querySelectorAll('.video-tile:not(.local-tile) video').forEach(v => {
     v.muted = false; v.volume = 1.0; v.play().catch(() => {});
@@ -508,7 +538,6 @@ function forceUnlockAudio() {
   audioUnlocked = true;
 }
 
-// ── Leave ─────────────────────────────────────────────────────
 function leaveRoom() {
   if (isScreenSharing && screenStream) screenStream.getTracks().forEach(t => t.stop());
   Object.keys(peers).forEach(id => peers[id].close());
@@ -517,11 +546,9 @@ function leaveRoom() {
   window.location.href = '/';
 }
 
-// ── Copy ──────────────────────────────────────────────────────
 function copyRoomId() { navigator.clipboard.writeText(ROOM_ID).then(() => showToast('Meeting ID copied!')); }
 function copyLink()   { navigator.clipboard.writeText(window.location.href).then(() => showToast('Link copied!')); }
 
-// ── Timer ─────────────────────────────────────────────────────
 setInterval(() => {
   const s  = Math.floor((Date.now() - startTime) / 1000);
   const mm = String(Math.floor(s / 60)).padStart(2,'0');
@@ -529,7 +556,6 @@ setInterval(() => {
   document.getElementById('meeting-time').textContent = `${mm}:${ss}`;
 }, 1000);
 
-// ── Toast ─────────────────────────────────────────────────────
 let toastTimer;
 function showToast(msg) {
   const t = document.getElementById('toast');
