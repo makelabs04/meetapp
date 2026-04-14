@@ -27,6 +27,8 @@
       <button class="copy-btn" onclick="copyRoomId()" title="Copy meeting ID">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
       </button>
+      <!-- Host badge — shown only to the host via JS -->
+      <span class="host-badge hidden" id="host-badge">👑 Host</span>
     </div>
     <div class="top-right">
       <span class="participant-count" id="participant-count">1 participant</span>
@@ -77,6 +79,26 @@
         </button>
       </div>
     </div>
+
+    <!-- Participants Panel (Host Only) -->
+    <div class="participants-panel" id="participants-panel">
+      <div class="participants-panel-header">
+        <span>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75"/></svg>
+          Participants
+        </span>
+        <button class="close-chat" onclick="toggleParticipantsPanel()">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="host-controls-info">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>
+        Host controls
+      </div>
+      <div class="host-participants-list" id="host-participants-list">
+        <div class="hc-empty">No other participants</div>
+      </div>
+    </div>
   </div>
 
   <!-- Control Bar -->
@@ -105,6 +127,11 @@
         <span>Chat</span>
         <span class="chat-badge hidden" id="chat-badge">0</span>
       </button>
+      <!-- Participants button — shown only to host via JS -->
+      <button class="ctrl-btn hidden" id="participants-btn" onclick="toggleParticipantsPanel()" title="Manage participants">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75"/></svg>
+        <span>Manage</span>
+      </button>
       <button class="ctrl-btn leave-btn" onclick="leaveRoom()" title="Leave meeting">
         <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 3H6a2 2 0 00-2 2v14c0 1.1.9 2 2 2h4M16 17l5-5-5-5M21 12H9"/></svg>
         <span>Leave</span>
@@ -118,7 +145,7 @@
     </div>
   </div>
 
-  <!-- ══ FOCUS OVERLAY — big screen for shared screen ══ -->
+  <!-- ══ FOCUS OVERLAY ══ -->
   <div class="focus-overlay hidden" id="focus-overlay">
     <div class="focus-header">
       <div class="focus-title">
