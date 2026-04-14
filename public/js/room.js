@@ -1,5 +1,7 @@
 // ============================================================
-//  MeetSpace - Room Client  (Fixed: screenshare + pip + min/max for all)
+//  MeetSpace — Room Client
+//  Fixes: screenshare blank after timeout, fullscreen expand,
+//         track mute/unmute recovery, server screen state relay
 // ============================================================
 
 const socket = io();
@@ -11,13 +13,14 @@ let localStream     = null;
 let screenStream    = null;
 let isScreenSharing = false;
 let screenMinimized = false;
-let micEnabled  = true;
-let camEnabled  = true;
-let chatOpen    = false;
-let unreadCount = 0;
-let startTime   = Date.now();
-let audioUnlocked = false;
-let localMinimized = false;
+let micEnabled      = true;
+let camEnabled      = true;
+let chatOpen        = false;
+let unreadCount     = 0;
+let startTime       = Date.now();
+let audioUnlocked   = false;
+let localMinimized  = false;
+let focusedPeer     = null; // socketId of peer whose screen is fullscreen-expanded
 
 const ICE_SERVERS = {
   iceServers: [
@@ -41,7 +44,11 @@ const chatBadge        = document.getElementById('chat-badge');
 const participantCount = document.getElementById('participant-count');
 const screenPreview    = document.getElementById('screen-preview');
 const screenPreviewVid = document.getElementById('screen-preview-video');
+const focusOverlay     = document.getElementById('focus-overlay');
+const focusVideo       = document.getElementById('focus-video');
+const focusName        = document.getElementById('focus-name');
 
+// ── Autoplay unlock ───────────────────────────────────────────
 function unlockAudio() {
   if (audioUnlocked) return;
   audioUnlocked = true;
@@ -57,23 +64,24 @@ document.getElementById('display-room-id').textContent = ROOM_ID;
 localNameLabel.textContent = USER_NAME + ' (You)';
 localAvatar.textContent    = USER_NAME.charAt(0).toUpperCase();
 
+// ── Init ──────────────────────────────────────────────────────
 async function init() {
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+      video: { width:{ideal:1280}, height:{ideal:720}, frameRate:{ideal:30} },
+      audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
     });
     localVideo.srcObject = localStream;
     localVideo.muted = true;
     localPlaceholder.classList.add('hidden');
   } catch (err) {
-    console.error('[init] getUserMedia error:', err.name, err.message);
+    console.error('[init] getUserMedia:', err.name, err.message);
     try {
       localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
       camEnabled = false;
       showToast('Camera unavailable — audio only');
-    } catch (e2) {
-      micEnabled = false; camEnabled = false;
+    } catch {
+      micEnabled = camEnabled = false;
       showToast('No camera/mic — joining as viewer');
     }
     syncBtnUI();
@@ -82,6 +90,7 @@ async function init() {
   updateGridLayout();
 }
 
+// ── Socket events ─────────────────────────────────────────────
 socket.on('room-users', async ({ participants }) => {
   for (const p of participants) {
     if (!peers[p.socketId]) {
@@ -121,6 +130,8 @@ socket.on('ice-candidate', async ({ from, candidate }) => {
 
 socket.on('user-left', ({ socketId, userName }) => {
   const name = peerNames[socketId] || userName;
+  // Close focus overlay if this peer was focused
+  if (focusedPeer === socketId) closeFocusOverlay();
   removePeer(socketId);
   addSystemMessage(`${name} left`);
   delete peerNames[socketId];
@@ -139,10 +150,17 @@ socket.on('chat-message', ({ userName, message, time, socketId: sid }) => {
 socket.on('peer-media-state', ({ socketId, video, audio, screen }) => {
   const tile = document.getElementById(`tile-${socketId}`);
   if (!tile) return;
+
   const micIcon = tile.querySelector('.tile-icon');
   if (micIcon) micIcon.className = 'tile-icon ' + (audio ? 'mic-on' : 'mic-off');
+
   const ph = tile.querySelector('.no-video-placeholder');
   if (ph) ph.classList.toggle('hidden', !!(video || screen));
+
+  // Show/hide expand button based on whether peer is screensharing
+  const expandBtn = tile.querySelector('.tile-action-expand');
+  if (expandBtn) expandBtn.classList.toggle('hidden', !screen);
+
   let label = tile.querySelector('.screenshare-label');
   if (screen) {
     tile.classList.add('screenshare-tile');
@@ -152,30 +170,29 @@ socket.on('peer-media-state', ({ socketId, video, audio, screen }) => {
       label.textContent = '🖥 Presenting';
       tile.appendChild(label);
     }
+    // Auto-open focus overlay for everyone when someone starts sharing
+    openFocusOverlay(socketId);
   } else {
     tile.classList.remove('screenshare-tile');
     if (label) label.remove();
+    // If this peer was in focus overlay, close it
+    if (focusedPeer === socketId) closeFocusOverlay();
   }
 });
 
+// ── Peer connection ───────────────────────────────────────────
 async function createPeer(socketId, initiator) {
   const pc = new RTCPeerConnection(ICE_SERVERS);
   peers[socketId] = pc;
 
-  if (localStream) {
-    localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
-  }
+  if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
-  // If already screen sharing, send screen track to new peer immediately
+  // Send current screen track if already sharing
   if (isScreenSharing && screenStream) {
-    const screenTrack = screenStream.getVideoTracks()[0];
-    if (screenTrack) {
-      const videoSender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
-      if (videoSender) {
-        videoSender.replaceTrack(screenTrack).catch(e => console.warn('[new peer screen replaceTrack]', e));
-      } else {
-        pc.addTrack(screenTrack, screenStream);
-      }
+    const st = screenStream.getVideoTracks()[0];
+    if (st) {
+      const vs = pc.getSenders().find(s => s.track?.kind === 'video');
+      vs ? vs.replaceTrack(st).catch(()=>{}) : pc.addTrack(st, screenStream);
     }
   }
 
@@ -191,45 +208,71 @@ async function createPeer(socketId, initiator) {
   peerStreams[socketId] = new MediaStream();
 
   pc.ontrack = ({ track }) => {
-    console.log(`[peer ${socketId}] received ${track.kind} track, id=${track.id}`);
+    console.log(`[peer ${socketId}] ontrack ${track.kind} id=${track.id} readyState=${track.readyState}`);
     const stream = peerStreams[socketId];
 
+    // Remove stale track of same kind
     stream.getTracks().filter(t => t.kind === track.kind).forEach(t => stream.removeTrack(t));
     stream.addTrack(track);
     if (track.kind === 'audio') track.enabled = true;
 
-    const tile = document.getElementById(`tile-${socketId}`);
-    if (tile) {
-      const vid = tile.querySelector('video');
-      if (vid) {
-        // KEY FIX: null then reassign forces browser to re-render with new track
-        vid.srcObject = null;
-        vid.srcObject = stream;
-        vid.muted  = false;
-        vid.volume = 1.0;
-        safePlay(vid);
-        if (track.kind === 'video') {
-          const ph = tile.querySelector('.no-video-placeholder');
-          if (ph) ph.classList.add('hidden');
-        }
-      }
-    } else {
-      addRemoteTile(socketId, stream);
-    }
+    // FIX: handle track going mute/unmute (happens when screenshare replaces cam track)
+    track.onmute = () => {
+      console.log(`[peer ${socketId}] track muted ${track.kind}`);
+      // Don't blank the video — the track will unmute when data resumes
+    };
+    track.onunmute = () => {
+      console.log(`[peer ${socketId}] track unmuted ${track.kind}`);
+      refreshTileVideo(socketId, stream);
+    };
+    // FIX: handle track ending (screenshare stopped)
+    track.onended = () => {
+      console.log(`[peer ${socketId}] track ended ${track.kind}`);
+      stream.removeTrack(track);
+      refreshTileVideo(socketId, stream);
+    };
+
+    refreshTileVideo(socketId, stream, track);
     updateGridLayout();
   };
 
-  if (!document.getElementById(`tile-${socketId}`)) {
-    addRemoteTile(socketId, peerStreams[socketId]);
-  }
+  if (!document.getElementById(`tile-${socketId}`)) addRemoteTile(socketId, peerStreams[socketId]);
 
   if (initiator) {
-    const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+    const offer = await pc.createOffer({ offerToReceiveAudio:true, offerToReceiveVideo:true });
     await pc.setLocalDescription(offer);
     socket.emit('offer', { to: socketId, offer, from: socket.id, fromName: USER_NAME });
   }
-
   return pc;
+}
+
+// ── FIX: centralized video refresh — null+reassign forces browser re-render ──
+function refreshTileVideo(socketId, stream, newTrack) {
+  const tile = document.getElementById(`tile-${socketId}`);
+  if (!tile) { addRemoteTile(socketId, stream); return; }
+  const vid = tile.querySelector('video');
+  if (!vid) return;
+
+  // null → reassign forces the HTMLVideoElement to flush & repaint
+  vid.srcObject = null;
+  vid.srcObject = stream;
+  vid.muted  = false;
+  vid.volume = 1.0;
+  safePlay(vid);
+
+  if (newTrack?.kind === 'video' || stream.getVideoTracks().length > 0) {
+    const ph = tile.querySelector('.no-video-placeholder');
+    if (ph) ph.classList.add('hidden');
+  }
+
+  // Also refresh the focus overlay if this peer is focused
+  if (focusedPeer === socketId && focusVideo) {
+    focusVideo.srcObject = null;
+    focusVideo.srcObject = stream;
+    focusVideo.muted  = false;
+    focusVideo.volume = 1.0;
+    safePlay(focusVideo);
+  }
 }
 
 function removePeer(socketId) {
@@ -241,6 +284,7 @@ function removePeer(socketId) {
   updateParticipantCount();
 }
 
+// ── Remote tile ───────────────────────────────────────────────
 function addRemoteTile(socketId, stream) {
   if (document.getElementById(`tile-${socketId}`)) return;
   const name    = peerNames[socketId] || 'Participant';
@@ -252,11 +296,14 @@ function addRemoteTile(socketId, stream) {
   tile.innerHTML = `
     <video autoplay playsinline></video>
     <div class="tile-controls">
-      <button class="tile-action-btn tile-action-min" onclick="minimizeTile('${socketId}')" title="Minimize">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="10" y1="14" x2="3" y2="21"/><line x1="21" y1="3" x2="14" y2="10"/></svg>
-      </button>
-      <button class="tile-action-btn tile-action-max hidden" onclick="maximizeTile('${socketId}')" title="Maximize">
+      <button class="tile-action-btn tile-action-expand hidden" onclick="openFocusOverlay('${socketId}')" title="Expand screen">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+      </button>
+      <button class="tile-action-btn tile-action-min" onclick="minimizeTile('${socketId}')" title="Minimize">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 20 15 20 15 15"/><polyline points="4 4 9 4 9 9"/><line x1="15" y1="20" x2="21" y2="14"/><line x1="9" y1="4" x2="3" y2="10"/></svg>
+      </button>
+      <button class="tile-action-btn tile-action-max hidden" onclick="maximizeTile('${socketId}')" title="Restore">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
       </button>
     </div>
     <div class="tile-info">
@@ -273,7 +320,7 @@ function addRemoteTile(socketId, stream) {
 
   const vid = tile.querySelector('video');
   vid.volume = 1.0;
-  if (stream && stream.getTracks().length > 0) {
+  if (stream?.getTracks().length > 0) {
     vid.srcObject = stream;
     safePlay(vid);
     if (stream.getVideoTracks().length > 0) {
@@ -284,6 +331,30 @@ function addRemoteTile(socketId, stream) {
   updateGridLayout();
 }
 
+// ── Focus overlay (big-screen expand for shared screen) ───────
+function openFocusOverlay(socketId) {
+  const stream = peerStreams[socketId];
+  if (!stream) return;
+  focusedPeer = socketId;
+  const name = peerNames[socketId] || 'Participant';
+  focusName.textContent = name + ' — Screen Share';
+
+  focusVideo.srcObject = null;
+  focusVideo.srcObject = stream;
+  focusVideo.muted  = false;
+  focusVideo.volume = 1.0;
+  safePlay(focusVideo);
+
+  focusOverlay.classList.remove('hidden');
+}
+
+function closeFocusOverlay() {
+  focusedPeer = null;
+  focusOverlay.classList.add('hidden');
+  focusVideo.srcObject = null;
+}
+
+// ── Tile min/max ──────────────────────────────────────────────
 function minimizeTile(socketId) {
   const tile = document.getElementById(`tile-${socketId}`);
   if (!tile) return;
@@ -292,7 +363,6 @@ function minimizeTile(socketId) {
   tile.querySelector('.tile-action-max').classList.remove('hidden');
   updateGridLayout();
 }
-
 function maximizeTile(socketId) {
   const tile = document.getElementById(`tile-${socketId}`);
   if (!tile) return;
@@ -301,7 +371,6 @@ function maximizeTile(socketId) {
   tile.querySelector('.tile-action-max').classList.add('hidden');
   updateGridLayout();
 }
-
 function toggleLocalTile() {
   const tile = document.getElementById('local-tile');
   localMinimized = !localMinimized;
@@ -311,27 +380,56 @@ function toggleLocalTile() {
   updateGridLayout();
 }
 
+// ── safePlay ──────────────────────────────────────────────────
 function safePlay(videoEl) {
-  videoEl.muted  = false;
-  videoEl.volume = 1.0;
   const p = videoEl.play();
   if (p) p.catch(err => {
-    if (err.name === 'NotAllowedError') {
-      document.getElementById('audio-banner').classList.remove('hidden');
-    }
+    if (err.name === 'NotAllowedError') document.getElementById('audio-banner').classList.remove('hidden');
   });
 }
 
+// ── FIX: Periodic health-check — detects frozen/blank videos ──
+setInterval(() => {
+  Object.keys(peerStreams).forEach(socketId => {
+    const stream = peerStreams[socketId];
+    if (!stream) return;
+    const tile = document.getElementById(`tile-${socketId}`);
+    if (!tile) return;
+    const vid = tile.querySelector('video');
+    if (!vid || !vid.srcObject) {
+      // srcObject lost — reattach
+      vid.srcObject = stream;
+      safePlay(vid);
+      console.log(`[health] reattached srcObject for ${socketId}`);
+    } else if (vid.readyState === 0 && stream.getVideoTracks().length > 0) {
+      // Video element stalled — force refresh
+      vid.srcObject = null;
+      vid.srcObject = stream;
+      safePlay(vid);
+      console.log(`[health] refreshed stalled video for ${socketId}`);
+    }
+    // Also keep focus overlay in sync
+    if (focusedPeer === socketId && focusVideo) {
+      if (!focusVideo.srcObject || focusVideo.readyState === 0) {
+        focusVideo.srcObject = null;
+        focusVideo.srcObject = stream;
+        safePlay(focusVideo);
+      }
+    }
+  });
+}, 4000);
+
+// ── Grid ──────────────────────────────────────────────────────
 function updateGridLayout() {
   const count = videoGrid.children.length;
   videoGrid.setAttribute('data-count', Math.min(count, 6));
 }
-
 function updateParticipantCount() {
   const n = Object.keys(peers).length + 1;
   participantCount.textContent = n === 1 ? '1 participant' : `${n} participants`;
 }
 
+// ── Mic / Camera ──────────────────────────────────────────────
 function toggleMic() {
   if (!localStream) return;
   micEnabled = !micEnabled;
@@ -340,7 +438,6 @@ function toggleMic() {
   syncBtnUI();
   socket.emit('media-state', { roomId: ROOM_ID, video: camEnabled, audio: micEnabled, screen: isScreenSharing });
 }
-
 function toggleCamera() {
   if (!localStream) return;
   camEnabled = !camEnabled;
@@ -349,7 +446,6 @@ function toggleCamera() {
   syncBtnUI();
   socket.emit('media-state', { roomId: ROOM_ID, video: camEnabled, audio: micEnabled, screen: isScreenSharing });
 }
-
 function syncBtnUI() {
   const mb = document.getElementById('mic-btn');
   mb.querySelector('.icon-on').classList.toggle('hidden', !micEnabled);
@@ -363,8 +459,8 @@ function syncBtnUI() {
   cb.classList.toggle('off', !camEnabled);
   cb.querySelector('span').textContent = camEnabled ? 'Camera' : 'Start Cam';
 }
-function updateButtons() { syncBtnUI(); }
 
+// ── Screen Share ──────────────────────────────────────────────
 async function toggleScreenShare() {
   isScreenSharing ? stopScreenShare() : await startScreenShare();
 }
@@ -372,7 +468,7 @@ async function toggleScreenShare() {
 async function startScreenShare() {
   try {
     screenStream = await navigator.mediaDevices.getDisplayMedia({
-      video: { cursor: 'always', frameRate: { ideal: 30, max: 60 }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+      video: { cursor:'always', frameRate:{ideal:30,max:60}, width:{ideal:1920}, height:{ideal:1080} },
       audio: false
     });
   } catch (err) {
@@ -380,35 +476,29 @@ async function startScreenShare() {
     return;
   }
 
-  isScreenSharing   = true;
-  screenMinimized   = false;
+  isScreenSharing = true;
+  screenMinimized = false;
   const screenTrack = screenStream.getVideoTracks()[0];
 
-  // KEY FIX: Replace video sender track per peer; null+reassign srcObject on remote forces re-render
-  const replacePromises = Object.keys(peers).map(async (socketId) => {
-    const pc = peers[socketId];
-    const videoSender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
-    if (videoSender) {
-      try {
-        await videoSender.replaceTrack(screenTrack);
-        console.log(`[screen] replaceTrack ok -> ${socketId}`);
-      } catch (e) {
-        console.warn(`[screen] replaceTrack failed -> ${socketId}, addTrack fallback`, e.message);
-        pc.addTrack(screenTrack, screenStream);
-      }
+  // Replace video track in all existing peers
+  await Promise.allSettled(Object.keys(peers).map(async sid => {
+    const pc = peers[sid];
+    const vs = pc.getSenders().find(s => s.track?.kind === 'video');
+    if (vs) {
+      try { await vs.replaceTrack(screenTrack); }
+      catch (e) { pc.addTrack(screenTrack, screenStream); }
     } else {
       pc.addTrack(screenTrack, screenStream);
     }
-  });
-  await Promise.allSettled(replacePromises);
+  }));
 
-  // PiP — muted so you don't hear yourself
+  // PiP preview
   screenPreviewVid.srcObject = screenStream;
   screenPreviewVid.muted = true;
-  screenPreviewVid.play().catch(() => {});
+  screenPreviewVid.play().catch(()=>{});
   screenPreview.classList.remove('hidden', 'minimized');
 
-  // Local tile — show screen, remove mirror (mirror looks wrong for screen content)
+  // Local tile — no mirror for screen content
   localVideo.srcObject = screenStream;
   localVideo.muted = true;
   localVideo.style.transform = 'none';
@@ -441,25 +531,22 @@ function stopScreenShare() {
 
   if (screenStream) { screenStream.getTracks().forEach(t => t.stop()); screenStream = null; }
 
-  const camTrack = localStream ? localStream.getVideoTracks()[0] : null;
-  Object.keys(peers).forEach(socketId => {
-    const pc = peers[socketId];
-    const videoSender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
-    if (videoSender) {
-      videoSender.replaceTrack(camTrack || null).catch(e => console.warn('[stop screen replaceTrack]', e.message));
-    }
+  const camTrack = localStream?.getVideoTracks()[0] || null;
+  Object.keys(peers).forEach(sid => {
+    const pc = peers[sid];
+    const vs = pc.getSenders().find(s => s.track?.kind === 'video');
+    if (vs) vs.replaceTrack(camTrack).catch(()=>{});
   });
 
   if (localStream) {
     localVideo.srcObject = localStream;
-    localVideo.style.transform = ''; // restore CSS class mirror
+    localVideo.style.transform = '';
     localPlaceholder.classList.toggle('hidden', camEnabled);
   }
 
   const localTile = document.getElementById('local-tile');
   localTile.classList.remove('screenshare-tile');
-  const lbl = localTile.querySelector('.screenshare-label');
-  if (lbl) lbl.remove();
+  localTile.querySelector('.screenshare-label')?.remove();
 
   screenPreview.classList.add('hidden');
   screenPreviewVid.srcObject = null;
@@ -475,6 +562,7 @@ function stopScreenShare() {
   showToast('Screen sharing stopped');
 }
 
+// ── PiP ───────────────────────────────────────────────────────
 function toggleScreenPreview() {
   screenMinimized = !screenMinimized;
   screenPreview.classList.toggle('minimized', screenMinimized);
@@ -485,6 +573,7 @@ function toggleScreenPreview() {
     : `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="10" y1="14" x2="3" y2="21"/><line x1="21" y1="3" x2="14" y2="10"/></svg>`;
 }
 
+// ── Chat ──────────────────────────────────────────────────────
 function toggleChat() {
   chatOpen = !chatOpen;
   chatPanel.classList.toggle('open', chatOpen);
@@ -496,14 +585,12 @@ function toggleChat() {
     chatMessages.scrollTop = chatMessages.scrollHeight;
   }
 }
-
 function sendMessage() {
   const msg = chatInput.value.trim();
   if (!msg) return;
   socket.emit('chat-message', { roomId: ROOM_ID, message: msg, userName: USER_NAME });
   chatInput.value = '';
 }
-
 function appendMessage(userName, message, time, isOwn) {
   const div = document.createElement('div');
   div.className = 'chat-msg' + (isOwn ? ' own' : '');
@@ -516,7 +603,6 @@ function appendMessage(userName, message, time, isOwn) {
   chatMessages.appendChild(div);
   chatMessages.scrollTop = chatMessages.scrollHeight;
 }
-
 function addSystemMessage(text) {
   const div = document.createElement('div');
   div.className = 'chat-system';
@@ -524,14 +610,13 @@ function addSystemMessage(text) {
   chatMessages.appendChild(div);
   chatMessages.scrollTop = chatMessages.scrollHeight;
 }
-
 chatInput.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
 });
 
 function forceUnlockAudio() {
   document.querySelectorAll('.video-tile:not(.local-tile) video').forEach(v => {
-    v.muted = false; v.volume = 1.0; v.play().catch(() => {});
+    v.muted = false; v.volume = 1.0; v.play().catch(()=>{});
   });
   document.getElementById('audio-banner').classList.add('hidden');
   showToast('Audio enabled!');
@@ -563,7 +648,6 @@ function showToast(msg) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => t.classList.remove('show'), 2600);
 }
-
 function escapeHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
