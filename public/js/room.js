@@ -2,6 +2,7 @@
 //  MeetSpace — Room Client
 //  Fixes: screenshare blank after timeout, fullscreen expand,
 //         track mute/unmute recovery, server screen state relay
+//  Added: Host controls (mute mic/cam, kick participants)
 // ============================================================
 
 const socket = io();
@@ -20,7 +21,11 @@ let unreadCount     = 0;
 let startTime       = Date.now();
 let audioUnlocked   = false;
 let localMinimized  = false;
-let focusedPeer     = null; // socketId of peer whose screen is fullscreen-expanded
+let focusedPeer     = null;
+
+// Host state
+let isHost          = false;
+let hostSocketId    = null;
 
 const ICE_SERVERS = {
   iceServers: [
@@ -91,7 +96,11 @@ async function init() {
 }
 
 // ── Socket events ─────────────────────────────────────────────
-socket.on('room-users', async ({ participants }) => {
+socket.on('room-users', async ({ participants, hostSocketId: hid, isHost: iAmHost }) => {
+  isHost = iAmHost;
+  hostSocketId = hid;
+  applyHostUI();
+
   for (const p of participants) {
     if (!peers[p.socketId]) {
       peerNames[p.socketId] = p.userName;
@@ -99,12 +108,14 @@ socket.on('room-users', async ({ participants }) => {
     }
   }
   updateParticipantCount();
+  updateHostPanel(participants);
 });
 
-socket.on('user-joined', ({ socketId, userName }) => {
+socket.on('user-joined', ({ socketId, userName, participants }) => {
   peerNames[socketId] = userName;
   addSystemMessage(`${userName} joined`);
   updateParticipantCount();
+  if (isHost && participants) updateHostPanel(participants);
 });
 
 socket.on('offer', async ({ from, offer, fromName }) => {
@@ -130,7 +141,6 @@ socket.on('ice-candidate', async ({ from, candidate }) => {
 
 socket.on('user-left', ({ socketId, userName }) => {
   const name = peerNames[socketId] || userName;
-  // Close focus overlay if this peer was focused
   if (focusedPeer === socketId) closeFocusOverlay();
   removePeer(socketId);
   addSystemMessage(`${name} left`);
@@ -157,7 +167,6 @@ socket.on('peer-media-state', ({ socketId, video, audio, screen }) => {
   const ph = tile.querySelector('.no-video-placeholder');
   if (ph) ph.classList.toggle('hidden', !!(video || screen));
 
-  // Show/hide expand button based on whether peer is screensharing
   const expandBtn = tile.querySelector('.tile-action-expand');
   if (expandBtn) expandBtn.classList.toggle('hidden', !screen);
 
@@ -170,15 +179,201 @@ socket.on('peer-media-state', ({ socketId, video, audio, screen }) => {
       label.textContent = '🖥 Presenting';
       tile.appendChild(label);
     }
-    // Auto-open focus overlay for everyone when someone starts sharing
     openFocusOverlay(socketId);
   } else {
     tile.classList.remove('screenshare-tile');
     if (label) label.remove();
-    // If this peer was in focus overlay, close it
     if (focusedPeer === socketId) closeFocusOverlay();
   }
+
+  // Update host-control panel buttons if we are host
+  if (isHost) {
+    const micBtn = document.getElementById(`hc-mic-${socketId}`);
+    const camBtn = document.getElementById(`hc-cam-${socketId}`);
+    if (micBtn) micBtn.classList.toggle('muted', !audio);
+    if (camBtn) camBtn.classList.toggle('muted', !video);
+  }
 });
+
+// ── Host-specific socket events ───────────────────────────────
+socket.on('participants-updated', ({ participants }) => {
+  if (isHost) updateHostPanel(participants);
+});
+
+socket.on('you-are-now-host', () => {
+  isHost = true;
+  hostSocketId = socket.id;
+  applyHostUI();
+  showToast('👑 You are now the host');
+  addSystemMessage('You became the host');
+});
+
+socket.on('host-changed', ({ hostSocketId: newHost }) => {
+  hostSocketId = newHost;
+  // Update crown badge on tiles
+  document.querySelectorAll('.host-crown').forEach(el => el.remove());
+  const tile = document.getElementById(`tile-${newHost}`);
+  if (tile) {
+    const crown = document.createElement('div');
+    crown.className = 'host-crown';
+    crown.title = 'Host';
+    crown.textContent = '👑';
+    tile.appendChild(crown);
+  }
+});
+
+// ── Remote control commands (received by participant) ─────────
+socket.on('remote-mute-mic', ({ mute }) => {
+  if (mute && micEnabled) {
+    micEnabled = false;
+    if (localStream) localStream.getAudioTracks().forEach(t => t.enabled = false);
+    document.getElementById('local-mic-icon').className = 'tile-icon mic-off';
+    syncBtnUI();
+    socket.emit('media-state', { roomId: ROOM_ID, video: camEnabled, audio: false, screen: isScreenSharing });
+    showToast('🔇 Host muted your microphone');
+  } else if (!mute && !micEnabled) {
+    micEnabled = true;
+    if (localStream) localStream.getAudioTracks().forEach(t => t.enabled = true);
+    document.getElementById('local-mic-icon').className = 'tile-icon mic-on';
+    syncBtnUI();
+    socket.emit('media-state', { roomId: ROOM_ID, video: camEnabled, audio: true, screen: isScreenSharing });
+    showToast('🎙 Host unmuted your microphone');
+  }
+});
+
+socket.on('remote-mute-cam', ({ mute }) => {
+  if (mute && camEnabled) {
+    camEnabled = false;
+    if (localStream) localStream.getVideoTracks().forEach(t => t.enabled = false);
+    localPlaceholder.classList.remove('hidden');
+    syncBtnUI();
+    socket.emit('media-state', { roomId: ROOM_ID, video: false, audio: micEnabled, screen: isScreenSharing });
+    showToast('📷 Host turned off your camera');
+  } else if (!mute && !camEnabled) {
+    camEnabled = true;
+    if (localStream) localStream.getVideoTracks().forEach(t => t.enabled = true);
+    localPlaceholder.classList.add('hidden');
+    syncBtnUI();
+    socket.emit('media-state', { roomId: ROOM_ID, video: true, audio: micEnabled, screen: isScreenSharing });
+    showToast('📸 Host turned on your camera');
+  }
+});
+
+socket.on('kicked-from-room', () => {
+  showToast('You were removed from the meeting by the host');
+  setTimeout(() => leaveRoom(), 1500);
+});
+
+// ── Host UI helpers ───────────────────────────────────────────
+function applyHostUI() {
+  const badge = document.getElementById('host-badge');
+  if (badge) badge.classList.toggle('hidden', !isHost);
+  const panelBtn = document.getElementById('participants-btn');
+  if (panelBtn) panelBtn.classList.toggle('hidden', !isHost);
+
+  // Add crown to own tile if host
+  const localTile = document.getElementById('local-tile');
+  if (localTile) {
+    localTile.querySelector('.host-crown')?.remove();
+    if (isHost) {
+      const crown = document.createElement('div');
+      crown.className = 'host-crown';
+      crown.title = 'You are the host';
+      crown.textContent = '👑';
+      localTile.appendChild(crown);
+    }
+  }
+}
+
+// Participants panel (host only)
+let participantsPanelOpen = false;
+function toggleParticipantsPanel() {
+  if (!isHost) return;
+  participantsPanelOpen = !participantsPanelOpen;
+  const panel = document.getElementById('participants-panel');
+  panel.classList.toggle('open', participantsPanelOpen);
+  document.getElementById('participants-btn').classList.toggle('active', participantsPanelOpen);
+}
+
+function updateHostPanel(participants) {
+  if (!isHost) return;
+  const list = document.getElementById('host-participants-list');
+  if (!list) return;
+  list.innerHTML = '';
+
+  participants.forEach(p => {
+    if (p.socketId === socket.id) return; // skip self
+    const div = document.createElement('div');
+    div.className = 'hc-participant';
+    div.id = `hc-row-${p.socketId}`;
+
+    const audioMuted = p.audio === false;
+    const videoMuted = p.video === false;
+
+    div.innerHTML = `
+      <div class="hc-avatar">${escapeHtml(p.userName.charAt(0).toUpperCase())}</div>
+      <div class="hc-name">${escapeHtml(p.userName)}</div>
+      <div class="hc-actions">
+        <button id="hc-mic-${p.socketId}"
+          class="hc-btn ${audioMuted ? 'muted' : ''}"
+          title="${audioMuted ? 'Unmute mic' : 'Mute mic'}"
+          onclick="hostToggleMic('${p.socketId}', this)">
+          ${audioMuted
+            ? `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M19 11a7 7 0 01-7.93 6.93L9.4 16.26A5 5 0 0017 11h2zm-7 7a5 5 0 01-5-5v-.17L3.41 9.41 2 10.83l2.07 2.07A7.001 7.001 0 0011 18.93V21H9v2h6v-2h-2v-2.07c.35-.04.69-.1 1.02-.19L22 21.17l1.41-1.42L3.41 1 2 2.41l8.17 8.17V11a2 2 0 004 .15V5.83L16.59 8A3.98 3.98 0 0016 6a4 4 0 00-8 0v5a4 4 0 01.07-.73z"/></svg>`
+            : `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 1a4 4 0 014 4v6a4 4 0 01-8 0V5a4 4 0 014-4zm-1 15.93V20H9v2h6v-2h-2v-3.07A7.001 7.001 0 0019 11h-2a5 5 0 01-10 0H5a7.001 7.001 0 006 6.93z"/></svg>`
+          }
+        </button>
+        <button id="hc-cam-${p.socketId}"
+          class="hc-btn ${videoMuted ? 'muted' : ''}"
+          title="${videoMuted ? 'Turn on camera' : 'Turn off camera'}"
+          onclick="hostToggleCam('${p.socketId}', this)">
+          ${videoMuted
+            ? `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 16v1a2 2 0 01-2 2H3a2 2 0 01-2-2V7a2 2 0 012-2h2m5.66 0H14a2 2 0 012 2v3.34l1 1L23 7v10M1 1l22 22"/></svg>`
+            : `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 10l4.553-2.069A1 1 0 0121 8.87v6.26a1 1 0 01-1.447.9L15 14M3 8a2 2 0 012-2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z"/></svg>`
+          }
+        </button>
+        <button class="hc-btn hc-kick" title="Remove from meeting"
+          onclick="hostKick('${p.socketId}', '${escapeHtml(p.userName)}')">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 3H6a2 2 0 00-2 2v14c0 1.1.9 2 2 2h4M16 17l5-5-5-5M21 12H9"/></svg>
+        </button>
+      </div>`;
+    list.appendChild(div);
+  });
+
+  // Show empty state
+  if (list.children.length === 0) {
+    list.innerHTML = '<div class="hc-empty">No other participants</div>';
+  }
+}
+
+function hostToggleMic(targetSocketId, btn) {
+  const isMuted = btn.classList.contains('muted');
+  socket.emit('host-mute-mic', { roomId: ROOM_ID, targetSocketId, mute: !isMuted });
+  // Optimistically toggle UI
+  btn.classList.toggle('muted', !isMuted);
+  btn.title = !isMuted ? 'Unmute mic' : 'Mute mic';
+  // swap icon
+  const micOnSvg  = `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 1a4 4 0 014 4v6a4 4 0 01-8 0V5a4 4 0 014-4zm-1 15.93V20H9v2h6v-2h-2v-3.07A7.001 7.001 0 0019 11h-2a5 5 0 01-10 0H5a7.001 7.001 0 006 6.93z"/></svg>`;
+  const micOffSvg = `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M19 11a7 7 0 01-7.93 6.93L9.4 16.26A5 5 0 0017 11h2zm-7 7a5 5 0 01-5-5v-.17L3.41 9.41 2 10.83l2.07 2.07A7.001 7.001 0 0011 18.93V21H9v2h6v-2h-2v-2.07c.35-.04.69-.1 1.02-.19L22 21.17l1.41-1.42L3.41 1 2 2.41l8.17 8.17V11a2 2 0 004 .15V5.83L16.59 8A3.98 3.98 0 0016 6a4 4 0 00-8 0v5a4 4 0 01.07-.73z"/></svg>`;
+  btn.innerHTML = !isMuted ? micOffSvg : micOnSvg;
+}
+
+function hostToggleCam(targetSocketId, btn) {
+  const isMuted = btn.classList.contains('muted');
+  socket.emit('host-mute-cam', { roomId: ROOM_ID, targetSocketId, mute: !isMuted });
+  btn.classList.toggle('muted', !isMuted);
+  btn.title = !isMuted ? 'Turn on camera' : 'Turn off camera';
+  const camOnSvg  = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 10l4.553-2.069A1 1 0 0121 8.87v6.26a1 1 0 01-1.447.9L15 14M3 8a2 2 0 012-2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z"/></svg>`;
+  const camOffSvg = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 16v1a2 2 0 01-2 2H3a2 2 0 01-2-2V7a2 2 0 012-2h2m5.66 0H14a2 2 0 012 2v3.34l1 1L23 7v10M1 1l22 22"/></svg>`;
+  btn.innerHTML = !isMuted ? camOffSvg : camOnSvg;
+}
+
+function hostKick(targetSocketId, name) {
+  if (!confirm(`Remove ${name} from the meeting?`)) return;
+  socket.emit('host-kick', { roomId: ROOM_ID, targetSocketId });
+  // Remove their row from panel
+  document.getElementById(`hc-row-${targetSocketId}`)?.remove();
+}
 
 // ── Peer connection ───────────────────────────────────────────
 async function createPeer(socketId, initiator) {
@@ -187,7 +382,6 @@ async function createPeer(socketId, initiator) {
 
   if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
-  // Send current screen track if already sharing
   if (isScreenSharing && screenStream) {
     const st = screenStream.getVideoTracks()[0];
     if (st) {
@@ -211,21 +405,17 @@ async function createPeer(socketId, initiator) {
     console.log(`[peer ${socketId}] ontrack ${track.kind} id=${track.id} readyState=${track.readyState}`);
     const stream = peerStreams[socketId];
 
-    // Remove stale track of same kind
     stream.getTracks().filter(t => t.kind === track.kind).forEach(t => stream.removeTrack(t));
     stream.addTrack(track);
     if (track.kind === 'audio') track.enabled = true;
 
-    // FIX: handle track going mute/unmute (happens when screenshare replaces cam track)
     track.onmute = () => {
       console.log(`[peer ${socketId}] track muted ${track.kind}`);
-      // Don't blank the video — the track will unmute when data resumes
     };
     track.onunmute = () => {
       console.log(`[peer ${socketId}] track unmuted ${track.kind}`);
       refreshTileVideo(socketId, stream);
     };
-    // FIX: handle track ending (screenshare stopped)
     track.onended = () => {
       console.log(`[peer ${socketId}] track ended ${track.kind}`);
       stream.removeTrack(track);
@@ -246,14 +436,12 @@ async function createPeer(socketId, initiator) {
   return pc;
 }
 
-// ── FIX: centralized video refresh — null+reassign forces browser re-render ──
 function refreshTileVideo(socketId, stream, newTrack) {
   const tile = document.getElementById(`tile-${socketId}`);
   if (!tile) { addRemoteTile(socketId, stream); return; }
   const vid = tile.querySelector('video');
   if (!vid) return;
 
-  // null → reassign forces the HTMLVideoElement to flush & repaint
   vid.srcObject = null;
   vid.srcObject = stream;
   vid.muted  = false;
@@ -265,7 +453,6 @@ function refreshTileVideo(socketId, stream, newTrack) {
     if (ph) ph.classList.add('hidden');
   }
 
-  // Also refresh the focus overlay if this peer is focused
   if (focusedPeer === socketId && focusVideo) {
     focusVideo.srcObject = null;
     focusVideo.srcObject = stream;
@@ -280,6 +467,8 @@ function removePeer(socketId) {
   delete peerStreams[socketId];
   const tile = document.getElementById(`tile-${socketId}`);
   if (tile) tile.remove();
+  // Remove from host panel
+  document.getElementById(`hc-row-${socketId}`)?.remove();
   updateGridLayout();
   updateParticipantCount();
 }
@@ -318,6 +507,15 @@ function addRemoteTile(socketId, stream) {
       <div class="avatar-circle">${escapeHtml(initial)}</div>
     </div>`;
 
+  // Add host crown if this is the host
+  if (socketId === hostSocketId) {
+    const crown = document.createElement('div');
+    crown.className = 'host-crown';
+    crown.title = 'Host';
+    crown.textContent = '👑';
+    tile.appendChild(crown);
+  }
+
   const vid = tile.querySelector('video');
   vid.volume = 1.0;
   if (stream?.getTracks().length > 0) {
@@ -331,7 +529,7 @@ function addRemoteTile(socketId, stream) {
   updateGridLayout();
 }
 
-// ── Focus overlay (big-screen expand for shared screen) ───────
+// ── Focus overlay ─────────────────────────────────────────────
 function openFocusOverlay(socketId) {
   const stream = peerStreams[socketId];
   if (!stream) return;
@@ -388,7 +586,7 @@ function safePlay(videoEl) {
   });
 }
 
-// ── FIX: Periodic health-check — detects frozen/blank videos ──
+// ── Periodic health-check ─────────────────────────────────────
 setInterval(() => {
   Object.keys(peerStreams).forEach(socketId => {
     const stream = peerStreams[socketId];
@@ -397,18 +595,13 @@ setInterval(() => {
     if (!tile) return;
     const vid = tile.querySelector('video');
     if (!vid || !vid.srcObject) {
-      // srcObject lost — reattach
       vid.srcObject = stream;
       safePlay(vid);
-      console.log(`[health] reattached srcObject for ${socketId}`);
     } else if (vid.readyState === 0 && stream.getVideoTracks().length > 0) {
-      // Video element stalled — force refresh
       vid.srcObject = null;
       vid.srcObject = stream;
       safePlay(vid);
-      console.log(`[health] refreshed stalled video for ${socketId}`);
     }
-    // Also keep focus overlay in sync
     if (focusedPeer === socketId && focusVideo) {
       if (!focusVideo.srcObject || focusVideo.readyState === 0) {
         focusVideo.srcObject = null;
@@ -480,7 +673,6 @@ async function startScreenShare() {
   screenMinimized = false;
   const screenTrack = screenStream.getVideoTracks()[0];
 
-  // Replace video track in all existing peers
   await Promise.allSettled(Object.keys(peers).map(async sid => {
     const pc = peers[sid];
     const vs = pc.getSenders().find(s => s.track?.kind === 'video');
@@ -492,13 +684,11 @@ async function startScreenShare() {
     }
   }));
 
-  // PiP preview
   screenPreviewVid.srcObject = screenStream;
   screenPreviewVid.muted = true;
   screenPreviewVid.play().catch(()=>{});
   screenPreview.classList.remove('hidden', 'minimized');
 
-  // Local tile — no mirror for screen content
   localVideo.srcObject = screenStream;
   localVideo.muted = true;
   localVideo.style.transform = 'none';
