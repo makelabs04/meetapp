@@ -229,6 +229,13 @@ socket.on('user-left', ({ socketId, userName }) => {
   addSystemMessage(`${name} left`);
   delete peerNames[socketId];
   updateParticipantCount();
+  // If host panel is now empty after removal, show empty state
+  if (isHost) {
+    const list = document.getElementById('host-participants-list');
+    if (list && list.querySelectorAll('.hc-participant').length === 0) {
+      list.innerHTML = '<div class="hc-empty">No other participants</div>';
+    }
+  }
 });
 
 socket.on('chat-message', ({ userName, message, time, socketId: sid }) => {
