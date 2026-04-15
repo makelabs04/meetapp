@@ -23,7 +23,7 @@ app.get('/room/:roomId',    (req, res) => res.render('room', { roomId: req.param
 
 app.post('/create-room', (req, res) => {
   const roomId = uuidv4().substring(0, 8);
-  rooms[roomId] = { participants: [], host: null, originalHostName: null, createdAt: Date.now(), waiting: [] };
+  rooms[roomId] = { participants: [], host: null, originalHostName: null, createdAt: Date.now(), waiting: [], admittedNames: new Set() };
   res.json({ roomId });
 });
 
@@ -39,7 +39,7 @@ io.on('connection', (socket) => {
   socket.on('join-room', ({ roomId, userName }) => {
     // Create room if it doesn't exist (e.g. host joined via link)
     if (!rooms[roomId]) {
-      rooms[roomId] = { participants: [], host: null, originalHostName: null, createdAt: Date.now(), waiting: [] };
+      rooms[roomId] = { participants: [], host: null, originalHostName: null, createdAt: Date.now(), waiting: [], admittedNames: new Set() };
     }
 
     const room = rooms[roomId];
@@ -58,6 +58,9 @@ io.on('connection', (socket) => {
       if (isOriginalHostRejoining) {
         socket.to(roomId).emit('host-changed', { hostSocketId: socket.id });
       }
+    } else if (room.admittedNames && room.admittedNames.has(userName)) {
+      // Previously admitted user rejoining — skip the waiting room, admit directly
+      _admitParticipant(socket, roomId, userName, false, room);
     } else {
       // Others: go to waiting room — host must admit them
       room.waiting.push({ socketId: socket.id, userName });
@@ -170,10 +173,6 @@ io.on('connection', (socket) => {
     if (wasInRoom) {
       // Broadcast user-left ONLY if they were actually admitted
       socket.to(roomId).emit('user-left', { socketId: socket.id, userName: socket.userName });
-      // Update host's participant panel so left member no longer appears
-      if (room.host) {
-        io.to(room.host).emit('participants-updated', { participants: room.participants });
-      }
     }
 
     if (wasHost && room.participants.length > 0) {
@@ -205,6 +204,10 @@ function _admitParticipant(socket, roomId, userName, isHost, room) {
   if (!room.participants.find(p => p.socketId === socket.id)) {
     room.participants.push({ socketId: socket.id, userName, isHost, video: true, audio: true });
   }
+
+  // Remember this name was admitted so they can rejoin without waiting
+  if (!room.admittedNames) room.admittedNames = new Set();
+  room.admittedNames.add(userName);
 
   socket.join(roomId);
   socket.roomId   = roomId;
