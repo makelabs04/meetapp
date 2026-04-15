@@ -10,203 +10,277 @@
 </head>
 <body>
 
-  <!-- Top Bar -->
-  <header class="top-bar">
-    <div class="logo-sm">
-      <svg width="26" height="26" viewBox="0 0 32 32" fill="none">
-        <circle cx="16" cy="16" r="16" fill="url(#lg2)"/>
-        <path d="M9 12h9a3 3 0 013 3v5H12a3 3 0 01-3-3v-5z" fill="white" opacity="0.9"/>
-        <path d="M21 14l5-3v10l-5-3v-4z" fill="white"/>
-        <defs><linearGradient id="lg2" x1="0" y1="0" x2="32" y2="32"><stop stop-color="#00adee"/><stop offset="1" stop-color="#0088cc"/></linearGradient></defs>
-      </svg>
-      MeetSpace
-    </div>
-    <div class="meeting-info">
-      <span class="room-id-label">Meeting ID:</span>
-      <span class="room-id-val" id="display-room-id"></span>
-      <button class="copy-btn" onclick="copyRoomId()" title="Copy meeting ID">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+  <!-- ══ NAME ENTRY GATE (shown when joining via direct link) ══ -->
+  <div class="gate-overlay" id="gate-overlay">
+    <div class="gate-card">
+      <div class="gate-logo">
+        <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+          <circle cx="16" cy="16" r="16" fill="url(#gatelg)"/>
+          <path d="M9 12h9a3 3 0 013 3v5H12a3 3 0 01-3-3v-5z" fill="white" opacity="0.9"/>
+          <path d="M21 14l5-3v10l-5-3v-4z" fill="white"/>
+          <defs><linearGradient id="gatelg" x1="0" y1="0" x2="32" y2="32"><stop stop-color="#00adee"/><stop offset="1" stop-color="#0088cc"/></linearGradient></defs>
+        </svg>
+        <span>MeetSpace</span>
+      </div>
+      <h2>Ready to join?</h2>
+      <p class="gate-sub">Enter your name to request access to this meeting.</p>
+      <div class="gate-input-group">
+        <input type="text" id="gate-name-input" placeholder="Your name" maxlength="30" autofocus/>
+      </div>
+      <button class="gate-btn" id="gate-btn" onclick="gateJoin()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 012 2v14a2 2 0 01-2 2h-4M10 17l5-5-5-5M13 12H3"/></svg>
+        Ask to Join
       </button>
-      <!-- Host badge — shown only to the host via JS -->
-      <span class="host-badge hidden" id="host-badge">👑 Host</span>
+      <p class="gate-error hidden" id="gate-error">Please enter your name</p>
     </div>
-    <div class="top-right">
-      <span class="participant-count" id="participant-count">1 participant</span>
-    </div>
-  </header>
+  </div>
 
-  <!-- Main area -->
-  <div class="main-area">
-    <div class="video-grid" id="video-grid">
-      <!-- Local tile -->
-      <div class="video-tile local-tile" id="local-tile">
-        <video id="local-video" autoplay muted playsinline></video>
-        <div class="tile-controls">
-          <button class="tile-action-btn tile-action-min" id="local-min-btn" onclick="toggleLocalTile()" title="Minimize">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 20 15 20 15 15"/><polyline points="4 4 9 4 9 9"/><line x1="15" y1="20" x2="21" y2="14"/><line x1="9" y1="4" x2="3" y2="10"/></svg>
-          </button>
-          <button class="tile-action-btn tile-action-max hidden" id="local-max-btn" onclick="toggleLocalTile()" title="Restore">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
-          </button>
-        </div>
-        <div class="tile-info">
-          <div class="tile-name" id="local-name-label">You</div>
-          <div class="tile-icons">
-            <span class="tile-icon mic-on" id="local-mic-icon">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 1a4 4 0 014 4v6a4 4 0 01-8 0V5a4 4 0 014-4zm-1 15.93V20H9v2h6v-2h-2v-3.07A7.001 7.001 0 0119 11h-2a5 5 0 01-10 0H5a7.001 7.001 0 006 6.93z"/></svg>
-            </span>
+  <!-- ══ WAITING FOR ADMISSION ══ -->
+  <div class="gate-overlay hidden" id="waiting-overlay">
+    <div class="gate-card">
+      <div class="gate-logo">
+        <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+          <circle cx="16" cy="16" r="16" fill="url(#waitlg)"/>
+          <path d="M9 12h9a3 3 0 013 3v5H12a3 3 0 01-3-3v-5z" fill="white" opacity="0.9"/>
+          <path d="M21 14l5-3v10l-5-3v-4z" fill="white"/>
+          <defs><linearGradient id="waitlg" x1="0" y1="0" x2="32" y2="32"><stop stop-color="#00adee"/><stop offset="1" stop-color="#0088cc"/></linearGradient></defs>
+        </svg>
+        <span>MeetSpace</span>
+      </div>
+      <div class="waiting-spinner"></div>
+      <h2>Waiting to be admitted</h2>
+      <p class="gate-sub">The host will let you in soon. Please wait...</p>
+      <button class="gate-btn gate-btn-outline" onclick="cancelWait()">Cancel</button>
+    </div>
+  </div>
+
+  <!-- ══ DENIED OVERLAY ══ -->
+  <div class="gate-overlay hidden" id="denied-overlay">
+    <div class="gate-card">
+      <div class="denied-icon">✕</div>
+      <h2>Entry denied</h2>
+      <p class="gate-sub">The host did not admit you to this meeting.</p>
+      <button class="gate-btn" onclick="window.location.href='/'">Return to Home</button>
+    </div>
+  </div>
+
+  <!-- ══ MAIN ROOM UI (hidden until admitted) ══ -->
+  <div id="room-ui" class="hidden">
+
+    <!-- Top Bar -->
+    <header class="top-bar">
+      <div class="logo-sm">
+        <svg width="26" height="26" viewBox="0 0 32 32" fill="none">
+          <circle cx="16" cy="16" r="16" fill="url(#lg2)"/>
+          <path d="M9 12h9a3 3 0 013 3v5H12a3 3 0 01-3-3v-5z" fill="white" opacity="0.9"/>
+          <path d="M21 14l5-3v10l-5-3v-4z" fill="white"/>
+          <defs><linearGradient id="lg2" x1="0" y1="0" x2="32" y2="32"><stop stop-color="#00adee"/><stop offset="1" stop-color="#0088cc"/></linearGradient></defs>
+        </svg>
+        MeetSpace
+      </div>
+      <div class="meeting-info">
+        <span class="room-id-label">Meeting ID:</span>
+        <span class="room-id-val" id="display-room-id"></span>
+        <button class="copy-btn" onclick="copyRoomId()" title="Copy meeting ID">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+        </button>
+        <span class="host-badge hidden" id="host-badge">👑 Host</span>
+      </div>
+      <div class="top-right">
+        <span class="participant-count" id="participant-count">1 participant</span>
+      </div>
+    </header>
+
+    <!-- Main area -->
+    <div class="main-area">
+      <div class="video-grid" id="video-grid">
+        <!-- Local tile -->
+        <div class="video-tile local-tile" id="local-tile">
+          <video id="local-video" autoplay muted playsinline></video>
+          <div class="tile-controls">
+            <button class="tile-action-btn tile-action-min" id="local-min-btn" onclick="toggleLocalTile()" title="Minimize">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 20 15 20 15 15"/><polyline points="4 4 9 4 9 9"/><line x1="15" y1="20" x2="21" y2="14"/><line x1="9" y1="4" x2="3" y2="10"/></svg>
+            </button>
+            <button class="tile-action-btn tile-action-max hidden" id="local-max-btn" onclick="toggleLocalTile()" title="Restore">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+            </button>
+          </div>
+          <div class="tile-info">
+            <div class="tile-name" id="local-name-label">You</div>
+            <div class="tile-icons">
+              <span class="tile-icon mic-on" id="local-mic-icon">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 1a4 4 0 014 4v6a4 4 0 01-8 0V5a4 4 0 014-4zm-1 15.93V20H9v2h6v-2h-2v-3.07A7.001 7.001 0 0119 11h-2a5 5 0 01-10 0H5a7.001 7.001 0 006 6.93z"/></svg>
+              </span>
+            </div>
+          </div>
+          <div class="no-video-placeholder" id="local-placeholder">
+            <div class="avatar-circle" id="local-avatar">Y</div>
           </div>
         </div>
-        <div class="no-video-placeholder" id="local-placeholder">
-          <div class="avatar-circle" id="local-avatar">Y</div>
+      </div>
+
+      <!-- Chat Panel -->
+      <div class="chat-panel" id="chat-panel">
+        <div class="chat-header">
+          <span>In-call messages</span>
+          <button class="close-chat" onclick="toggleChat()">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        <div class="chat-messages" id="chat-messages"></div>
+        <div class="chat-input-area">
+          <input type="text" id="chat-input" placeholder="Send a message..." maxlength="500"/>
+          <button class="send-btn" onclick="sendMessage()">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- Participants Panel (Host Only) -->
+      <div class="participants-panel" id="participants-panel">
+        <div class="participants-panel-header">
+          <span>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75"/></svg>
+            Participants
+          </span>
+          <button class="close-chat" onclick="toggleParticipantsPanel()">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        <div class="host-controls-info">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>
+          Host controls
+        </div>
+        <div class="host-participants-list" id="host-participants-list">
+          <div class="hc-empty">No other participants</div>
         </div>
       </div>
     </div>
 
-    <!-- Chat Panel -->
-    <div class="chat-panel" id="chat-panel">
-      <div class="chat-header">
-        <span>In-call messages</span>
-        <button class="close-chat" onclick="toggleChat()">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    <!-- Control Bar -->
+    <div class="control-bar">
+      <div class="controls-left">
+        <div class="meeting-time" id="meeting-time">00:00</div>
+      </div>
+      <div class="controls-center">
+        <button class="ctrl-btn" id="mic-btn" onclick="toggleMic()" title="Toggle microphone">
+          <svg class="icon-on" width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M12 1a4 4 0 014 4v6a4 4 0 01-8 0V5a4 4 0 014-4zm-1 15.93V20H9v2h6v-2h-2v-3.07A7.001 7.001 0 0119 11h-2a5 5 0 01-10 0H5a7.001 7.001 0 006 6.93z"/></svg>
+          <svg class="icon-off hidden" width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M19 11a7 7 0 01-7.93 6.93L9.4 16.26A5 5 0 0017 11h2zm-7 7a5 5 0 01-5-5v-.17L3.41 9.41 2 10.83l2.07 2.07A7.001 7.001 0 0011 18.93V21H9v2h6v-2h-2v-2.07c.35-.04.69-.1 1.02-.19L22 21.17l1.41-1.42L3.41 1 2 2.41l8.17 8.17V11a2 2 0 004 .15V5.83L16.59 8A3.98 3.98 0 0016 6a4 4 0 00-8 0v5a4 4 0 01.07-.73z"/></svg>
+          <span>Mute</span>
+        </button>
+        <button class="ctrl-btn" id="cam-btn" onclick="toggleCamera()" title="Toggle camera">
+          <svg class="icon-on" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 10l4.553-2.069A1 1 0 0121 8.87v6.26a1 1 0 01-1.447.9L15 14M3 8a2 2 0 012-2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z"/></svg>
+          <svg class="icon-off hidden" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 16v1a2 2 0 01-2 2H3a2 2 0 01-2-2V7a2 2 0 012-2h2m5.66 0H14a2 2 0 012 2v3.34l1 1L23 7v10M1 1l22 22"/></svg>
+          <span>Camera</span>
+        </button>
+        <button class="ctrl-btn" id="screen-btn" onclick="toggleScreenShare()" title="Share screen">
+          <svg class="icon-on" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+          <svg class="icon-off hidden" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+          <span>Share</span>
+        </button>
+        <button class="ctrl-btn" onclick="toggleChat()" title="Toggle chat" id="chat-btn">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
+          <span>Chat</span>
+          <span class="chat-badge hidden" id="chat-badge">0</span>
+        </button>
+        <button class="ctrl-btn hidden" id="participants-btn" onclick="toggleParticipantsPanel()" title="Manage participants">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75"/></svg>
+          <span>Manage</span>
+          <span class="admit-badge hidden" id="admit-badge">0</span>
+        </button>
+        <button class="ctrl-btn leave-btn" onclick="leaveRoom()" title="Leave meeting">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 3H6a2 2 0 00-2 2v14c0 1.1.9 2 2 2h4M16 17l5-5-5-5M21 12H9"/></svg>
+          <span>Leave</span>
         </button>
       </div>
-      <div class="chat-messages" id="chat-messages"></div>
-      <div class="chat-input-area">
-        <input type="text" id="chat-input" placeholder="Send a message..." maxlength="500"/>
-        <button class="send-btn" onclick="sendMessage()">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+      <div class="controls-right">
+        <button class="ctrl-btn-sm" onclick="copyLink()" title="Copy meeting link">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/></svg>
+          Share link
         </button>
       </div>
     </div>
 
-    <!-- Participants Panel (Host Only) -->
-    <div class="participants-panel" id="participants-panel">
-      <div class="participants-panel-header">
-        <span>
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75"/></svg>
-          Participants
+    <!-- ══ FOCUS OVERLAY — fullscreen shared screen ══ -->
+    <div class="focus-overlay hidden" id="focus-overlay">
+      <div class="focus-header">
+        <div class="focus-title">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+          <span id="focus-name">Screen Share</span>
+        </div>
+        <button class="focus-close-btn" onclick="closeFocusOverlay()">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          Close
+        </button>
+      </div>
+      <div class="focus-body">
+        <video id="focus-video" autoplay playsinline></video>
+      </div>
+    </div>
+
+    <!-- ══ PiP Screen Preview (draggable) ══ -->
+    <div class="screen-preview hidden" id="screen-preview">
+      <div class="screen-preview-header" id="screen-preview-drag-handle">
+        <span class="screen-preview-title">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+          Your Screen
+          <span class="drag-hint">· drag to move</span>
         </span>
-        <button class="close-chat" onclick="toggleParticipantsPanel()">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-        </button>
+        <div class="screen-preview-controls">
+          <button class="screen-preview-btn" id="screen-preview-toggle" onclick="toggleScreenPreview()" title="Minimize">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="10" y1="14" x2="3" y2="21"/><line x1="21" y1="3" x2="14" y2="10"/></svg>
+          </button>
+          <button class="screen-preview-btn stop-btn" onclick="stopScreenShare()" title="Stop sharing">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
+          </button>
+        </div>
       </div>
-      <div class="host-controls-info">
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>
-        Host controls
+      <div class="screen-preview-body">
+        <video id="screen-preview-video" autoplay muted playsinline></video>
       </div>
-      <div class="host-participants-list" id="host-participants-list">
-        <div class="hc-empty">No other participants</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Control Bar -->
-  <div class="control-bar">
-    <div class="controls-left">
-      <div class="meeting-time" id="meeting-time">00:00</div>
-    </div>
-    <div class="controls-center">
-      <button class="ctrl-btn" id="mic-btn" onclick="toggleMic()" title="Toggle microphone">
-        <svg class="icon-on" width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M12 1a4 4 0 014 4v6a4 4 0 01-8 0V5a4 4 0 014-4zm-1 15.93V20H9v2h6v-2h-2v-3.07A7.001 7.001 0 0019 11h-2a5 5 0 01-10 0H5a7.001 7.001 0 006 6.93z"/></svg>
-        <svg class="icon-off hidden" width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M19 11a7 7 0 01-7.93 6.93L9.4 16.26A5 5 0 0017 11h2zm-7 7a5 5 0 01-5-5v-.17L3.41 9.41 2 10.83l2.07 2.07A7.001 7.001 0 0011 18.93V21H9v2h6v-2h-2v-2.07c.35-.04.69-.1 1.02-.19L22 21.17l1.41-1.42L3.41 1 2 2.41l8.17 8.17V11a2 2 0 004 .15V5.83L16.59 8A3.98 3.98 0 0016 6a4 4 0 00-8 0v5a4 4 0 01.07-.73z"/></svg>
-        <span>Mute</span>
-      </button>
-      <button class="ctrl-btn" id="cam-btn" onclick="toggleCamera()" title="Toggle camera">
-        <svg class="icon-on" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 10l4.553-2.069A1 1 0 0121 8.87v6.26a1 1 0 01-1.447.9L15 14M3 8a2 2 0 012-2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z"/></svg>
-        <svg class="icon-off hidden" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 16v1a2 2 0 01-2 2H3a2 2 0 01-2-2V7a2 2 0 012-2h2m5.66 0H14a2 2 0 012 2v3.34l1 1L23 7v10M1 1l22 22"/></svg>
-        <span>Camera</span>
-      </button>
-      <button class="ctrl-btn" id="screen-btn" onclick="toggleScreenShare()" title="Share screen">
-        <svg class="icon-on" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
-        <svg class="icon-off hidden" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
-        <span>Share</span>
-      </button>
-      <button class="ctrl-btn chat-toggle-btn" onclick="toggleChat()" title="Toggle chat" id="chat-btn">
-        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
-        <span>Chat</span>
-        <span class="chat-badge hidden" id="chat-badge">0</span>
-      </button>
-      <!-- Participants button — shown only to host via JS -->
-      <button class="ctrl-btn hidden" id="participants-btn" onclick="toggleParticipantsPanel()" title="Manage participants">
-        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75"/></svg>
-        <span>Manage</span>
-      </button>
-      <button class="ctrl-btn leave-btn" onclick="leaveRoom()" title="Leave meeting">
-        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 3H6a2 2 0 00-2 2v14c0 1.1.9 2 2 2h4M16 17l5-5-5-5M21 12H9"/></svg>
-        <span>Leave</span>
-      </button>
-    </div>
-    <div class="controls-right">
-      <button class="ctrl-btn-sm" onclick="copyLink()" title="Copy meeting link">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/></svg>
-        Share link
-      </button>
-    </div>
-  </div>
-
-  <!-- ══ FOCUS OVERLAY ══ -->
-  <div class="focus-overlay hidden" id="focus-overlay">
-    <div class="focus-header">
-      <div class="focus-title">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
-        <span id="focus-name">Screen Share</span>
-      </div>
-      <button class="focus-close-btn" onclick="closeFocusOverlay()" title="Close">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-        Close
-      </button>
-    </div>
-    <div class="focus-body">
-      <video id="focus-video" autoplay playsinline></video>
-    </div>
-  </div>
-
-  <!-- Screen Share PiP Preview -->
-  <div class="screen-preview hidden" id="screen-preview">
-    <div class="screen-preview-header">
-      <span class="screen-preview-title">
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
-        Your Screen
-      </span>
-      <div class="screen-preview-controls">
-        <button class="screen-preview-btn" id="screen-preview-toggle" onclick="toggleScreenPreview()" title="Minimize">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="10" y1="14" x2="3" y2="21"/><line x1="21" y1="3" x2="14" y2="10"/></svg>
-        </button>
-        <button class="screen-preview-btn stop-btn" onclick="stopScreenShare()" title="Stop sharing">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
-        </button>
+      <div class="screen-preview-footer">
+        <span>Presenting to everyone</span>
+        <button class="stop-share-text" onclick="stopScreenShare()">Stop sharing</button>
       </div>
     </div>
-    <div class="screen-preview-body">
-      <video id="screen-preview-video" autoplay muted playsinline></video>
+
+    <!-- ══ ADMISSION REQUEST TOAST (host only) ══ -->
+    <div class="admit-toast hidden" id="admit-toast">
+      <div class="admit-toast-info">
+        <div class="admit-avatar" id="admit-avatar">?</div>
+        <div class="admit-text">
+          <div class="admit-name" id="admit-name">Someone</div>
+          <div class="admit-sub">wants to join</div>
+        </div>
+      </div>
+      <div class="admit-actions">
+        <button class="admit-deny-btn" id="admit-deny-btn" onclick="handleAdmit(false)">Deny</button>
+        <button class="admit-allow-btn" id="admit-allow-btn" onclick="handleAdmit(true)">Admit</button>
+      </div>
     </div>
-    <div class="screen-preview-footer">
-      <span>Presenting to everyone</span>
-      <button class="stop-share-text" onclick="stopScreenShare()">Stop sharing</button>
+
+    <!-- Screen Share Banner -->
+    <div class="screen-banner hidden" id="screen-banner">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+      You are presenting your screen
+      <button onclick="stopScreenShare()">Stop sharing</button>
     </div>
-  </div>
 
-  <!-- Screen Share Banner -->
-  <div class="screen-banner hidden" id="screen-banner">
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
-    You are presenting your screen
-    <button onclick="stopScreenShare()">Stop sharing</button>
-  </div>
+    <!-- Audio Unlock Banner -->
+    <div class="audio-banner hidden" id="audio-banner">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 1a4 4 0 014 4v6a4 4 0 01-8 0V5a4 4 0 014-4zm-1 15.93V20H9v2h6v-2h-2v-3.07A7.001 7.001 0 0119 11h-2a5 5 0 01-10 0H5a7.001 7.001 0 006 6.93z"/></svg>
+      Audio muted by browser.
+      <button onclick="forceUnlockAudio()">Click to Enable Audio</button>
+    </div>
 
-  <!-- Audio Unlock Banner -->
-  <div class="audio-banner hidden" id="audio-banner">
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 1a4 4 0 014 4v6a4 4 0 01-8 0V5a4 4 0 014-4zm-1 15.93V20H9v2h6v-2h-2v-3.07A7.001 7.001 0 0119 11h-2a5 5 0 01-10 0H5a7.001 7.001 0 006 6.93z"/></svg>
-    Audio muted by browser.
-    <button onclick="forceUnlockAudio()">Click to Enable Audio</button>
-  </div>
+    <div class="toast" id="toast"></div>
 
-  <div class="toast" id="toast"></div>
+  </div><!-- end #room-ui -->
 
   <script src="/socket.io/socket.io.js"></script>
   <script>
-    const ROOM_ID   = '<%= roomId %>';
-    const USER_NAME = sessionStorage.getItem('userName') || 'Guest_' + Math.floor(Math.random() * 1000);
+    const ROOM_ID = '<%= roomId %>';
+    // USER_NAME resolved in room.js after gate check
   </script>
   <script src="/js/room.js"></script>
 </body>
