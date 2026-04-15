@@ -170,6 +170,10 @@ io.on('connection', (socket) => {
     if (wasInRoom) {
       // Broadcast user-left ONLY if they were actually admitted
       socket.to(roomId).emit('user-left', { socketId: socket.id, userName: socket.userName });
+      // Update host's participant panel so left member no longer appears
+      if (room.host) {
+        io.to(room.host).emit('participants-updated', { participants: room.participants });
+      }
     }
 
     if (wasHost && room.participants.length > 0) {
