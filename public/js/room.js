@@ -231,7 +231,6 @@ socket.on('user-left', ({ socketId, userName }) => {
   if (focusedPeer === socketId) closeFocusOverlay();
   removePeer(socketId);
   addSystemMessage(`${name} left`);
-  delete peerNames[socketId];
   // Remove from admit queue if they left while waiting
   admitQueue = admitQueue.filter(q => q.socketId !== socketId);
   if (pendingAdmission && pendingAdmission.socketId === socketId) {
@@ -557,6 +556,8 @@ async function createPeer(socketId, initiator) {
 
 // FIX: null → reassign forces browser to re-render with new/replaced track
 function refreshTileVideo(socketId, stream, newTrack) {
+  // Don't create/refresh tiles for peers that are no longer tracked
+  if (!peers[socketId] && !peerNames[socketId]) return;
   const tile = document.getElementById(`tile-${socketId}`);
   if (!tile) { addRemoteTile(socketId, stream); return; }
   const vid = tile.querySelector('video');
@@ -585,9 +586,15 @@ function refreshTileVideo(socketId, stream, newTrack) {
 function removePeer(socketId) {
   if (peers[socketId]) { peers[socketId].close(); delete peers[socketId]; }
   delete peerStreams[socketId];
+  delete peerNames[socketId];
   const tile = document.getElementById(`tile-${socketId}`);
   if (tile) tile.remove();
   document.getElementById(`hc-row-${socketId}`)?.remove();
+  // Sweep any orphan tiles whose socketId has no peer and no known name (ghost "Participant" tiles)
+  document.querySelectorAll('.video-tile[id^="tile-"]').forEach(t => {
+    const sid = t.id.replace('tile-', '');
+    if (sid !== 'local' && !peers[sid] && !peerNames[sid]) t.remove();
+  });
   updateGridLayout();
   updateParticipantCount();
 }
