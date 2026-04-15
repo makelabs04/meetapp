@@ -114,7 +114,6 @@ io.on('connection', (socket) => {
   socket.on('chat-message', ({ roomId, message, userName }) => {
     io.in(roomId).emit('chat-message', {
       userName, message,
-      time: new Date().toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' }),
       socketId: socket.id
     });
   });
