@@ -250,7 +250,7 @@ socket.on('user-left', ({ socketId, userName }) => {
 });
 
 socket.on('chat-message', ({ userName, message, socketId: sid }) => {
-  const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const time = new Date().toLocaleTimeString(navigator.language || 'en', { hour: '2-digit', minute: '2-digit', hour12: true });
   appendMessage(userName, message, time, sid === socket.id);
   if (!chatOpen) {
     unreadCount++;
