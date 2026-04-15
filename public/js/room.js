@@ -185,9 +185,13 @@ socket.on('admission-denied', () => {
 });
 
 socket.on('user-joined', ({ socketId, userName, participants }) => {
-  // FIX: ignore if we already have this peer (prevents ghost tile on rejoin)
-  if (peers[socketId]) return;
+  // Always store the name — even if peer connection already exists
   peerNames[socketId] = userName;
+  // If peer already exists (duplicate join signal), don't create another
+  if (peers[socketId]) {
+    if (isHost && participants) updateHostPanel(participants);
+    return;
+  }
   addSystemMessage(`${userName} joined`);
   updateParticipantCount();
   if (isHost && participants) updateHostPanel(participants);
@@ -228,6 +232,14 @@ socket.on('user-left', ({ socketId, userName }) => {
   removePeer(socketId);
   addSystemMessage(`${name} left`);
   delete peerNames[socketId];
+  // Remove from admit queue if they left while waiting
+  admitQueue = admitQueue.filter(q => q.socketId !== socketId);
+  if (pendingAdmission && pendingAdmission.socketId === socketId) {
+    pendingAdmission = null;
+    document.getElementById('admit-toast').classList.add('hidden');
+    setTimeout(showNextAdmitToast, 400);
+  }
+  updateAdmitBadge();
   updateParticipantCount();
   // If host panel is now empty after removal, show empty state
   if (isHost) {
@@ -583,7 +595,18 @@ function removePeer(socketId) {
 // ── Remote tile ───────────────────────────────────────────────
 function addRemoteTile(socketId, stream) {
   // FIX: strict guard — never create duplicate tiles
-  if (document.getElementById(`tile-${socketId}`)) return;
+  if (document.getElementById(`tile-${socketId}`)) {
+    // If tile exists but has placeholder name, update it now that we have the real name
+    const existingTile = document.getElementById(`tile-${socketId}`);
+    const nameEl = existingTile?.querySelector('.tile-name');
+    if (nameEl && nameEl.textContent === 'Participant' && peerNames[socketId]) {
+      const realName = peerNames[socketId];
+      nameEl.textContent = realName;
+      const avatarEl = existingTile.querySelector('.avatar-circle');
+      if (avatarEl) avatarEl.textContent = realName.charAt(0).toUpperCase();
+    }
+    return;
+  }
   const name    = peerNames[socketId] || 'Participant';
   const initial = name.charAt(0).toUpperCase();
 
