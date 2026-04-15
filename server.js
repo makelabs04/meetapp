@@ -14,7 +14,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
 
 // In-memory room store
-// rooms[roomId] = { participants:[], host:null, createdAt, waiting:[] }
+// rooms[roomId] = { participants:[], host:null, originalHostName:null, createdAt, waiting:[] }
 // waiting entry: { socketId, userName, resolve }
 const rooms = {};
 
@@ -23,7 +23,7 @@ app.get('/room/:roomId',    (req, res) => res.render('room', { roomId: req.param
 
 app.post('/create-room', (req, res) => {
   const roomId = uuidv4().substring(0, 8);
-  rooms[roomId] = { participants: [], host: null, createdAt: Date.now(), waiting: [] };
+  rooms[roomId] = { participants: [], host: null, originalHostName: null, createdAt: Date.now(), waiting: [] };
   res.json({ roomId });
 });
 
@@ -39,16 +39,25 @@ io.on('connection', (socket) => {
   socket.on('join-room', ({ roomId, userName }) => {
     // Create room if it doesn't exist (e.g. host joined via link)
     if (!rooms[roomId]) {
-      rooms[roomId] = { participants: [], host: null, createdAt: Date.now(), waiting: [] };
+      rooms[roomId] = { participants: [], host: null, originalHostName: null, createdAt: Date.now(), waiting: [] };
     }
 
     const room = rooms[roomId];
     const isFirstPerson = room.participants.length === 0;
 
-    if (isFirstPerson) {
-      // First person: becomes host immediately, no waiting
+    // If this is the original host rejoining (same name, room still exists), restore host role
+    const isOriginalHostRejoining = !isFirstPerson && room.originalHostName && room.originalHostName === userName;
+
+    if (isFirstPerson || isOriginalHostRejoining) {
+      // First person or original host returning: becomes host immediately, no waiting
       room.host = socket.id;
+      if (!room.originalHostName) room.originalHostName = userName;
       _admitParticipant(socket, roomId, userName, true, room);
+
+      // If original host reclaimed, notify everyone else
+      if (isOriginalHostRejoining) {
+        socket.to(roomId).emit('host-changed', { hostSocketId: socket.id });
+      }
     } else {
       // Others: go to waiting room — host must admit them
       room.waiting.push({ socketId: socket.id, userName });
@@ -164,16 +173,17 @@ io.on('connection', (socket) => {
     }
 
     if (wasHost && room.participants.length > 0) {
-      const newHost = room.participants[0];
-      room.host = newHost.socketId;
-      newHost.isHost = true;
-      io.to(newHost.socketId).emit('you-are-now-host', {});
-      socket.to(roomId).emit('host-changed', { hostSocketId: newHost.socketId });
+      // Host left — do NOT auto-transfer. Notify others that host is gone.
+      // The original host will reclaim host role when they rejoin.
+      room.host = null;
+      socket.to(roomId).emit('host-left', {});
+      console.log(`Host left room ${roomId}. Waiting for original host (${room.originalHostName}) to rejoin.`);
 
-      // Send any pending waiting requests to the new host
+      // Deny all waiting participants since there's no host to admit them
       room.waiting.forEach(w => {
-        io.to(newHost.socketId).emit('admission-request', { socketId: w.socketId, userName: w.userName });
+        io.to(w.socketId).emit('admission-denied', {});
       });
+      room.waiting = [];
     }
 
     if (room.participants.length === 0 && room.waiting.length === 0) {
