@@ -166,6 +166,11 @@ socket.on('room-users', async ({ participants, hostSocketId: hid, isHost: iAmHos
   }
   updateParticipantCount();
   updateHostPanel(participants);
+
+  // If rejoining as host, send media state so others know our screen/mic/cam status
+  if (iAmHost) {
+    socket.emit('media-state', { roomId: ROOM_ID, video: camEnabled, audio: micEnabled, screen: false });
+  }
 });
 
 // Still waiting — host will send admission-request to themselves
@@ -257,7 +262,8 @@ socket.on('peer-media-state', ({ socketId, video, audio, screen }) => {
       label.textContent = '🖥 Presenting';
       tile.appendChild(label);
     }
-    openFocusOverlay(socketId);
+    // Small delay to let the video track settle before opening focus overlay
+    setTimeout(() => openFocusOverlay(socketId), 300);
   } else {
     tile.classList.remove('screenshare-tile');
     if (label) label.remove();
@@ -326,24 +332,38 @@ socket.on('participants-updated', ({ participants }) => {
   if (isHost) updateHostPanel(participants);
 });
 
+// NOTE: 'you-are-now-host' is no longer emitted by the server.
+// Host role is only reclaimed when the original host rejoins with the same name.
+// Keeping handler as no-op for backward compatibility.
 socket.on('you-are-now-host', () => {
-  isHost = true;
-  hostSocketId = socket.id;
-  applyHostUI();
-  showToast('👑 You are now the host');
-  addSystemMessage('You became the host');
-  // Re-send any pending waiting requests handled by server
+  // No-op: host role is reclaimed via rejoin, not auto-transferred
 });
 
 socket.on('host-changed', ({ hostSocketId: newHost }) => {
   hostSocketId = newHost;
   document.querySelectorAll('.host-crown').forEach(el => el.remove());
+  // Mark new host tile
   const tile = document.getElementById(`tile-${newHost}`);
   if (tile) {
     const crown = document.createElement('div');
     crown.className = 'host-crown'; crown.title = 'Host'; crown.textContent = '👑';
     tile.appendChild(crown);
   }
+  // If we ARE the new host (original host rejoining), update local tile too
+  if (newHost === socket.id) {
+    applyHostUI();
+  }
+});
+
+socket.on('host-left', () => {
+  hostSocketId = null;
+  // Remove all host crowns from remote tiles (host left, no new host until they return)
+  document.querySelectorAll('.host-crown').forEach(el => {
+    const tile = el.closest('.video-tile');
+    if (tile && !tile.classList.contains('local-tile')) el.remove();
+  });
+  addSystemMessage('Host left the meeting. Waiting for host to return...');
+  showToast('👑 Host left — meeting continues until host returns');
 });
 
 // ── Remote control (participant receives) ─────────────────────
@@ -463,11 +483,17 @@ async function createPeer(socketId, initiator) {
 
   if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
+  // FIX: when screen sharing is active, replace the video sender track with the screen track
+  // This ensures new peers receive the screen share, not a blank/camera track
   if (isScreenSharing && screenStream) {
-    const st = screenStream.getVideoTracks()[0];
-    if (st) {
-      const vs = pc.getSenders().find(s => s.track?.kind === 'video');
-      vs ? vs.replaceTrack(st).catch(()=>{}) : pc.addTrack(st, screenStream);
+    const screenTrack = screenStream.getVideoTracks()[0];
+    if (screenTrack) {
+      const videoSender = pc.getSenders().find(s => s.track?.kind === 'video');
+      if (videoSender) {
+        videoSender.replaceTrack(screenTrack).catch(() => {});
+      } else {
+        pc.addTrack(screenTrack, screenStream);
+      }
     }
   }
 
