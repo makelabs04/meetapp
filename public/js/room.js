@@ -1,8 +1,8 @@
 // ============================================================
 //  MeetSpace — Room Client
-//  Fixes: screenshare blank after timeout, fullscreen expand,
-//         track mute/unmute recovery, server screen state relay
-//  Added: Host controls (mute mic/cam, kick participants)
+//  Fixes: draggable PiP, PiP position clear of chat, focus
+//         overlay CSS, admission gate, ghost tiles, name prompt,
+//         track recovery, health-check, host controls
 // ============================================================
 
 const socket = io();
@@ -10,6 +10,7 @@ const peers       = {};
 const peerStreams  = {};
 const peerNames   = {};
 
+let USER_NAME       = '';   // set after gate
 let localStream     = null;
 let screenStream    = null;
 let isScreenSharing = false;
@@ -17,15 +18,16 @@ let screenMinimized = false;
 let micEnabled      = true;
 let camEnabled      = true;
 let chatOpen        = false;
+let participantsPanelOpen = false;
 let unreadCount     = 0;
 let startTime       = Date.now();
 let audioUnlocked   = false;
 let localMinimized  = false;
 let focusedPeer     = null;
-
-// Host state
 let isHost          = false;
 let hostSocketId    = null;
+let pendingAdmission = null;   // { socketId, userName } currently showing in admit toast
+let admitQueue      = [];      // queue of waiting requests
 
 const ICE_SERVERS = {
   iceServers: [
@@ -37,21 +39,76 @@ const ICE_SERVERS = {
   ]
 };
 
-const videoGrid        = document.getElementById('video-grid');
-const localVideo       = document.getElementById('local-video');
-const localPlaceholder = document.getElementById('local-placeholder');
-const localAvatar      = document.getElementById('local-avatar');
-const localNameLabel   = document.getElementById('local-name-label');
-const chatPanel        = document.getElementById('chat-panel');
-const chatMessages     = document.getElementById('chat-messages');
-const chatInput        = document.getElementById('chat-input');
-const chatBadge        = document.getElementById('chat-badge');
-const participantCount = document.getElementById('participant-count');
-const screenPreview    = document.getElementById('screen-preview');
-const screenPreviewVid = document.getElementById('screen-preview-video');
-const focusOverlay     = document.getElementById('focus-overlay');
-const focusVideo       = document.getElementById('focus-video');
-const focusName        = document.getElementById('focus-name');
+// ── DOM refs (only accessed after room-ui is shown) ───────────
+const videoGrid        = () => document.getElementById('video-grid');
+const localVideo       = () => document.getElementById('local-video');
+const localPlaceholder = () => document.getElementById('local-placeholder');
+const localAvatar      = () => document.getElementById('local-avatar');
+const localNameLabel   = () => document.getElementById('local-name-label');
+const chatPanel        = () => document.getElementById('chat-panel');
+const chatMessages     = () => document.getElementById('chat-messages');
+const chatInput        = () => document.getElementById('chat-input');
+const chatBadge        = () => document.getElementById('chat-badge');
+const participantCount = () => document.getElementById('participant-count');
+const screenPreview    = () => document.getElementById('screen-preview');
+const screenPreviewVid = () => document.getElementById('screen-preview-video');
+const focusOverlay     = () => document.getElementById('focus-overlay');
+const focusVideo       = () => document.getElementById('focus-video');
+const focusName        = () => document.getElementById('focus-name');
+
+// ── GATE: name entry / waiting / denied ───────────────────────
+function gateJoin() {
+  const input = document.getElementById('gate-name-input');
+  const name  = input.value.trim();
+  if (!name) {
+    document.getElementById('gate-error').classList.remove('hidden');
+    input.focus();
+    return;
+  }
+  USER_NAME = name;
+  sessionStorage.setItem('userName', name);
+
+  // Show waiting overlay
+  document.getElementById('gate-overlay').classList.add('hidden');
+  document.getElementById('waiting-overlay').classList.remove('hidden');
+
+  socket.emit('join-room', { roomId: ROOM_ID, userName: USER_NAME });
+}
+
+function cancelWait() {
+  socket.disconnect();
+  window.location.href = '/';
+}
+
+document.getElementById('gate-name-input')?.addEventListener('keydown', e => {
+  if (e.key === 'Enter') gateJoin();
+});
+
+// Check if name already known (came from index page)
+const _savedName = sessionStorage.getItem('userName');
+if (_savedName) {
+  USER_NAME = _savedName;
+  // Skip gate — go straight to waiting overlay, then emit join
+  document.getElementById('gate-overlay').classList.add('hidden');
+  document.getElementById('waiting-overlay').classList.remove('hidden');
+  socket.emit('join-room', { roomId: ROOM_ID, userName: USER_NAME });
+} else {
+  // Show gate (name entry)
+  document.getElementById('gate-overlay').classList.remove('hidden');
+}
+
+// ── Admitted — show main room UI ──────────────────────────────
+function showRoomUI() {
+  document.getElementById('waiting-overlay').classList.add('hidden');
+  document.getElementById('room-ui').classList.remove('hidden');
+
+  document.getElementById('display-room-id').textContent = ROOM_ID;
+  localNameLabel().textContent = USER_NAME + ' (You)';
+  localAvatar().textContent    = USER_NAME.charAt(0).toUpperCase();
+
+  startTimer();
+  initDraggablePip();
+}
 
 // ── Autoplay unlock ───────────────────────────────────────────
 function unlockAudio() {
@@ -65,20 +122,16 @@ function unlockAudio() {
 document.addEventListener('click',   unlockAudio);
 document.addEventListener('keydown', unlockAudio);
 
-document.getElementById('display-room-id').textContent = ROOM_ID;
-localNameLabel.textContent = USER_NAME + ' (You)';
-localAvatar.textContent    = USER_NAME.charAt(0).toUpperCase();
-
-// ── Init ──────────────────────────────────────────────────────
+// ── Init media ────────────────────────────────────────────────
 async function init() {
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
       video: { width:{ideal:1280}, height:{ideal:720}, frameRate:{ideal:30} },
       audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
     });
-    localVideo.srcObject = localStream;
-    localVideo.muted = true;
-    localPlaceholder.classList.add('hidden');
+    localVideo().srcObject = localStream;
+    localVideo().muted = true;
+    localPlaceholder().classList.add('hidden');
   } catch (err) {
     console.error('[init] getUserMedia:', err.name, err.message);
     try {
@@ -91,14 +144,18 @@ async function init() {
     }
     syncBtnUI();
   }
-  socket.emit('join-room', { roomId: ROOM_ID, userName: USER_NAME });
   updateGridLayout();
 }
 
 // ── Socket events ─────────────────────────────────────────────
+
+// Admitted by host (or first person)
 socket.on('room-users', async ({ participants, hostSocketId: hid, isHost: iAmHost }) => {
-  isHost = iAmHost;
+  isHost       = iAmHost;
   hostSocketId = hid;
+
+  showRoomUI();
+  await init();
   applyHostUI();
 
   for (const p of participants) {
@@ -111,7 +168,20 @@ socket.on('room-users', async ({ participants, hostSocketId: hid, isHost: iAmHos
   updateHostPanel(participants);
 });
 
+// Still waiting — host will send admission-request to themselves
+socket.on('waiting-for-admission', () => {
+  // Already showing waiting overlay — nothing extra needed
+});
+
+// Denied by host
+socket.on('admission-denied', () => {
+  document.getElementById('waiting-overlay').classList.add('hidden');
+  document.getElementById('denied-overlay').classList.remove('hidden');
+});
+
 socket.on('user-joined', ({ socketId, userName, participants }) => {
+  // FIX: ignore if we already have this peer (prevents ghost tile on rejoin)
+  if (peers[socketId]) return;
   peerNames[socketId] = userName;
   addSystemMessage(`${userName} joined`);
   updateParticipantCount();
@@ -120,7 +190,15 @@ socket.on('user-joined', ({ socketId, userName, participants }) => {
 
 socket.on('offer', async ({ from, offer, fromName }) => {
   peerNames[from] = fromName;
-  if (!peers[from]) await createPeer(from, false);
+  // FIX: if peer already exists, close old one cleanly before recreating
+  if (peers[from]) {
+    peers[from].close();
+    delete peers[from];
+    delete peerStreams[from];
+    const oldTile = document.getElementById(`tile-${from}`);
+    if (oldTile) oldTile.remove();
+  }
+  await createPeer(from, false);
   const pc = peers[from];
   await pc.setRemoteDescription(new RTCSessionDescription(offer));
   const answer = await pc.createAnswer();
@@ -152,8 +230,8 @@ socket.on('chat-message', ({ userName, message, time, socketId: sid }) => {
   appendMessage(userName, message, time, sid === socket.id);
   if (!chatOpen) {
     unreadCount++;
-    chatBadge.textContent = unreadCount;
-    chatBadge.classList.remove('hidden');
+    chatBadge().textContent = unreadCount;
+    chatBadge().classList.remove('hidden');
   }
 });
 
@@ -186,7 +264,6 @@ socket.on('peer-media-state', ({ socketId, video, audio, screen }) => {
     if (focusedPeer === socketId) closeFocusOverlay();
   }
 
-  // Update host-control panel buttons if we are host
   if (isHost) {
     const micBtn = document.getElementById(`hc-mic-${socketId}`);
     const camBtn = document.getElementById(`hc-cam-${socketId}`);
@@ -195,7 +272,56 @@ socket.on('peer-media-state', ({ socketId, video, audio, screen }) => {
   }
 });
 
-// ── Host-specific socket events ───────────────────────────────
+// ── HOST: admission requests ──────────────────────────────────
+socket.on('admission-request', ({ socketId, userName }) => {
+  admitQueue.push({ socketId, userName });
+  updateAdmitBadge();
+  showNextAdmitToast();
+});
+
+function showNextAdmitToast() {
+  if (pendingAdmission || admitQueue.length === 0) return;
+  pendingAdmission = admitQueue.shift();
+
+  const toast   = document.getElementById('admit-toast');
+  const nameEl  = document.getElementById('admit-name');
+  const avatarEl= document.getElementById('admit-avatar');
+  nameEl.textContent   = pendingAdmission.userName;
+  avatarEl.textContent = pendingAdmission.userName.charAt(0).toUpperCase();
+  toast.classList.remove('hidden');
+
+  // Auto-open participants panel so host sees context
+  if (!participantsPanelOpen) toggleParticipantsPanel();
+}
+
+function handleAdmit(allow) {
+  if (!pendingAdmission) return;
+  const { socketId, userName } = pendingAdmission;
+  pendingAdmission = null;
+  document.getElementById('admit-toast').classList.add('hidden');
+
+  if (allow) {
+    socket.emit('admit-participant', { roomId: ROOM_ID, targetSocketId: socketId });
+    addSystemMessage(`You admitted ${userName}`);
+  } else {
+    socket.emit('deny-participant', { roomId: ROOM_ID, targetSocketId: socketId });
+    addSystemMessage(`You denied ${userName}`);
+  }
+
+  updateAdmitBadge();
+  // Show next one if any
+  setTimeout(showNextAdmitToast, 400);
+}
+
+function updateAdmitBadge() {
+  const badge = document.getElementById('admit-badge');
+  if (!badge) return;
+  const total = admitQueue.length + (pendingAdmission ? 1 : 0);
+  badge.textContent = total;
+  badge.classList.toggle('hidden', total === 0);
+}
+
+// ── HOST: participants-updated ────────────────────────────────
 socket.on('participants-updated', ({ participants }) => {
   if (isHost) updateHostPanel(participants);
 });
@@ -206,57 +332,37 @@ socket.on('you-are-now-host', () => {
   applyHostUI();
   showToast('👑 You are now the host');
   addSystemMessage('You became the host');
+  // Re-send any pending waiting requests handled by server
 });
 
 socket.on('host-changed', ({ hostSocketId: newHost }) => {
   hostSocketId = newHost;
-  // Update crown badge on tiles
   document.querySelectorAll('.host-crown').forEach(el => el.remove());
   const tile = document.getElementById(`tile-${newHost}`);
   if (tile) {
     const crown = document.createElement('div');
-    crown.className = 'host-crown';
-    crown.title = 'Host';
-    crown.textContent = '👑';
+    crown.className = 'host-crown'; crown.title = 'Host'; crown.textContent = '👑';
     tile.appendChild(crown);
   }
 });
 
-// ── Remote control commands (received by participant) ─────────
+// ── Remote control (participant receives) ─────────────────────
 socket.on('remote-mute-mic', ({ mute }) => {
-  if (mute && micEnabled) {
-    micEnabled = false;
-    if (localStream) localStream.getAudioTracks().forEach(t => t.enabled = false);
-    document.getElementById('local-mic-icon').className = 'tile-icon mic-off';
-    syncBtnUI();
-    socket.emit('media-state', { roomId: ROOM_ID, video: camEnabled, audio: false, screen: isScreenSharing });
-    showToast('🔇 Host muted your microphone');
-  } else if (!mute && !micEnabled) {
-    micEnabled = true;
-    if (localStream) localStream.getAudioTracks().forEach(t => t.enabled = true);
-    document.getElementById('local-mic-icon').className = 'tile-icon mic-on';
-    syncBtnUI();
-    socket.emit('media-state', { roomId: ROOM_ID, video: camEnabled, audio: true, screen: isScreenSharing });
-    showToast('🎙 Host unmuted your microphone');
-  }
+  micEnabled = !mute;
+  if (localStream) localStream.getAudioTracks().forEach(t => t.enabled = micEnabled);
+  document.getElementById('local-mic-icon').className = 'tile-icon ' + (micEnabled ? 'mic-on' : 'mic-off');
+  syncBtnUI();
+  socket.emit('media-state', { roomId: ROOM_ID, video: camEnabled, audio: micEnabled, screen: isScreenSharing });
+  showToast(mute ? '🔇 Host muted your microphone' : '🎙 Host unmuted your microphone');
 });
 
 socket.on('remote-mute-cam', ({ mute }) => {
-  if (mute && camEnabled) {
-    camEnabled = false;
-    if (localStream) localStream.getVideoTracks().forEach(t => t.enabled = false);
-    localPlaceholder.classList.remove('hidden');
-    syncBtnUI();
-    socket.emit('media-state', { roomId: ROOM_ID, video: false, audio: micEnabled, screen: isScreenSharing });
-    showToast('📷 Host turned off your camera');
-  } else if (!mute && !camEnabled) {
-    camEnabled = true;
-    if (localStream) localStream.getVideoTracks().forEach(t => t.enabled = true);
-    localPlaceholder.classList.add('hidden');
-    syncBtnUI();
-    socket.emit('media-state', { roomId: ROOM_ID, video: true, audio: micEnabled, screen: isScreenSharing });
-    showToast('📸 Host turned on your camera');
-  }
+  camEnabled = !mute;
+  if (localStream) localStream.getVideoTracks().forEach(t => t.enabled = camEnabled);
+  localPlaceholder().classList.toggle('hidden', camEnabled);
+  syncBtnUI();
+  socket.emit('media-state', { roomId: ROOM_ID, video: camEnabled, audio: micEnabled, screen: isScreenSharing });
+  showToast(mute ? '📷 Host turned off your camera' : '📸 Host turned on your camera');
 });
 
 socket.on('kicked-from-room', () => {
@@ -264,34 +370,28 @@ socket.on('kicked-from-room', () => {
   setTimeout(() => leaveRoom(), 1500);
 });
 
-// ── Host UI helpers ───────────────────────────────────────────
+// ── Host UI ───────────────────────────────────────────────────
 function applyHostUI() {
   const badge = document.getElementById('host-badge');
   if (badge) badge.classList.toggle('hidden', !isHost);
   const panelBtn = document.getElementById('participants-btn');
   if (panelBtn) panelBtn.classList.toggle('hidden', !isHost);
 
-  // Add crown to own tile if host
   const localTile = document.getElementById('local-tile');
   if (localTile) {
     localTile.querySelector('.host-crown')?.remove();
     if (isHost) {
       const crown = document.createElement('div');
-      crown.className = 'host-crown';
-      crown.title = 'You are the host';
-      crown.textContent = '👑';
+      crown.className = 'host-crown'; crown.title = 'You are the host'; crown.textContent = '👑';
       localTile.appendChild(crown);
     }
   }
 }
 
-// Participants panel (host only)
-let participantsPanelOpen = false;
 function toggleParticipantsPanel() {
   if (!isHost) return;
   participantsPanelOpen = !participantsPanelOpen;
-  const panel = document.getElementById('participants-panel');
-  panel.classList.toggle('open', participantsPanelOpen);
+  document.getElementById('participants-panel').classList.toggle('open', participantsPanelOpen);
   document.getElementById('participants-btn').classList.toggle('active', participantsPanelOpen);
 }
 
@@ -301,77 +401,58 @@ function updateHostPanel(participants) {
   if (!list) return;
   list.innerHTML = '';
 
-  participants.forEach(p => {
-    if (p.socketId === socket.id) return; // skip self
+  const others = participants.filter(p => p.socketId !== socket.id);
+  if (others.length === 0) {
+    list.innerHTML = '<div class="hc-empty">No other participants</div>';
+    return;
+  }
+
+  others.forEach(p => {
     const div = document.createElement('div');
     div.className = 'hc-participant';
     div.id = `hc-row-${p.socketId}`;
-
     const audioMuted = p.audio === false;
     const videoMuted = p.video === false;
-
+    const micOnSvg  = `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 1a4 4 0 014 4v6a4 4 0 01-8 0V5a4 4 0 014-4zm-1 15.93V20H9v2h6v-2h-2v-3.07A7.001 7.001 0 0019 11h-2a5 5 0 01-10 0H5a7.001 7.001 0 006 6.93z"/></svg>`;
+    const micOffSvg = `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M19 11a7 7 0 01-7.93 6.93L9.4 16.26A5 5 0 0017 11h2zm-7 7a5 5 0 01-5-5v-.17L3.41 9.41 2 10.83l2.07 2.07A7.001 7.001 0 0011 18.93V21H9v2h6v-2h-2v-2.07c.35-.04.69-.1 1.02-.19L22 21.17l1.41-1.42L3.41 1 2 2.41l8.17 8.17V11a2 2 0 004 .15V5.83L16.59 8A3.98 3.98 0 0016 6a4 4 0 00-8 0v5a4 4 0 01.07-.73z"/></svg>`;
+    const camOnSvg  = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 10l4.553-2.069A1 1 0 0121 8.87v6.26a1 1 0 01-1.447.9L15 14M3 8a2 2 0 012-2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z"/></svg>`;
+    const camOffSvg = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 16v1a2 2 0 01-2 2H3a2 2 0 01-2-2V7a2 2 0 012-2h2m5.66 0H14a2 2 0 012 2v3.34l1 1L23 7v10M1 1l22 22"/></svg>`;
     div.innerHTML = `
       <div class="hc-avatar">${escapeHtml(p.userName.charAt(0).toUpperCase())}</div>
       <div class="hc-name">${escapeHtml(p.userName)}</div>
       <div class="hc-actions">
-        <button id="hc-mic-${p.socketId}"
-          class="hc-btn ${audioMuted ? 'muted' : ''}"
-          title="${audioMuted ? 'Unmute mic' : 'Mute mic'}"
-          onclick="hostToggleMic('${p.socketId}', this)">
-          ${audioMuted
-            ? `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M19 11a7 7 0 01-7.93 6.93L9.4 16.26A5 5 0 0017 11h2zm-7 7a5 5 0 01-5-5v-.17L3.41 9.41 2 10.83l2.07 2.07A7.001 7.001 0 0011 18.93V21H9v2h6v-2h-2v-2.07c.35-.04.69-.1 1.02-.19L22 21.17l1.41-1.42L3.41 1 2 2.41l8.17 8.17V11a2 2 0 004 .15V5.83L16.59 8A3.98 3.98 0 0016 6a4 4 0 00-8 0v5a4 4 0 01.07-.73z"/></svg>`
-            : `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 1a4 4 0 014 4v6a4 4 0 01-8 0V5a4 4 0 014-4zm-1 15.93V20H9v2h6v-2h-2v-3.07A7.001 7.001 0 0019 11h-2a5 5 0 01-10 0H5a7.001 7.001 0 006 6.93z"/></svg>`
-          }
+        <button id="hc-mic-${p.socketId}" class="hc-btn ${audioMuted?'muted':''}"
+          title="${audioMuted?'Unmute mic':'Mute mic'}" onclick="hostToggleMic('${p.socketId}',this)">
+          ${audioMuted ? micOffSvg : micOnSvg}
         </button>
-        <button id="hc-cam-${p.socketId}"
-          class="hc-btn ${videoMuted ? 'muted' : ''}"
-          title="${videoMuted ? 'Turn on camera' : 'Turn off camera'}"
-          onclick="hostToggleCam('${p.socketId}', this)">
-          ${videoMuted
-            ? `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 16v1a2 2 0 01-2 2H3a2 2 0 01-2-2V7a2 2 0 012-2h2m5.66 0H14a2 2 0 012 2v3.34l1 1L23 7v10M1 1l22 22"/></svg>`
-            : `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 10l4.553-2.069A1 1 0 0121 8.87v6.26a1 1 0 01-1.447.9L15 14M3 8a2 2 0 012-2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z"/></svg>`
-          }
+        <button id="hc-cam-${p.socketId}" class="hc-btn ${videoMuted?'muted':''}"
+          title="${videoMuted?'Turn on camera':'Turn off camera'}" onclick="hostToggleCam('${p.socketId}',this)">
+          ${videoMuted ? camOffSvg : camOnSvg}
         </button>
         <button class="hc-btn hc-kick" title="Remove from meeting"
-          onclick="hostKick('${p.socketId}', '${escapeHtml(p.userName)}')">
+          onclick="hostKick('${p.socketId}','${escapeHtml(p.userName)}')">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 3H6a2 2 0 00-2 2v14c0 1.1.9 2 2 2h4M16 17l5-5-5-5M21 12H9"/></svg>
         </button>
       </div>`;
     list.appendChild(div);
   });
-
-  // Show empty state
-  if (list.children.length === 0) {
-    list.innerHTML = '<div class="hc-empty">No other participants</div>';
-  }
 }
 
 function hostToggleMic(targetSocketId, btn) {
   const isMuted = btn.classList.contains('muted');
   socket.emit('host-mute-mic', { roomId: ROOM_ID, targetSocketId, mute: !isMuted });
-  // Optimistically toggle UI
   btn.classList.toggle('muted', !isMuted);
-  btn.title = !isMuted ? 'Unmute mic' : 'Mute mic';
-  // swap icon
-  const micOnSvg  = `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 1a4 4 0 014 4v6a4 4 0 01-8 0V5a4 4 0 014-4zm-1 15.93V20H9v2h6v-2h-2v-3.07A7.001 7.001 0 0019 11h-2a5 5 0 01-10 0H5a7.001 7.001 0 006 6.93z"/></svg>`;
-  const micOffSvg = `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M19 11a7 7 0 01-7.93 6.93L9.4 16.26A5 5 0 0017 11h2zm-7 7a5 5 0 01-5-5v-.17L3.41 9.41 2 10.83l2.07 2.07A7.001 7.001 0 0011 18.93V21H9v2h6v-2h-2v-2.07c.35-.04.69-.1 1.02-.19L22 21.17l1.41-1.42L3.41 1 2 2.41l8.17 8.17V11a2 2 0 004 .15V5.83L16.59 8A3.98 3.98 0 0016 6a4 4 0 00-8 0v5a4 4 0 01.07-.73z"/></svg>`;
-  btn.innerHTML = !isMuted ? micOffSvg : micOnSvg;
 }
 
 function hostToggleCam(targetSocketId, btn) {
   const isMuted = btn.classList.contains('muted');
   socket.emit('host-mute-cam', { roomId: ROOM_ID, targetSocketId, mute: !isMuted });
   btn.classList.toggle('muted', !isMuted);
-  btn.title = !isMuted ? 'Turn on camera' : 'Turn off camera';
-  const camOnSvg  = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 10l4.553-2.069A1 1 0 0121 8.87v6.26a1 1 0 01-1.447.9L15 14M3 8a2 2 0 012-2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z"/></svg>`;
-  const camOffSvg = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 16v1a2 2 0 01-2 2H3a2 2 0 01-2-2V7a2 2 0 012-2h2m5.66 0H14a2 2 0 012 2v3.34l1 1L23 7v10M1 1l22 22"/></svg>`;
-  btn.innerHTML = !isMuted ? camOffSvg : camOnSvg;
 }
 
 function hostKick(targetSocketId, name) {
   if (!confirm(`Remove ${name} from the meeting?`)) return;
   socket.emit('host-kick', { roomId: ROOM_ID, targetSocketId });
-  // Remove their row from panel
   document.getElementById(`hc-row-${targetSocketId}`)?.remove();
 }
 
@@ -396,31 +477,24 @@ async function createPeer(socketId, initiator) {
 
   pc.onconnectionstatechange = () => {
     console.log(`[peer ${socketId}] conn: ${pc.connectionState}`);
-    if (['disconnected','failed','closed'].includes(pc.connectionState)) removePeer(socketId);
+    // FIX: only remove on 'failed' or 'closed', NOT on 'disconnected'
+    // 'disconnected' is transient (network hiccup); removing on it causes ghost tiles
+    if (['failed','closed'].includes(pc.connectionState)) removePeer(socketId);
   };
 
   peerStreams[socketId] = new MediaStream();
 
   pc.ontrack = ({ track }) => {
-    console.log(`[peer ${socketId}] ontrack ${track.kind} id=${track.id} readyState=${track.readyState}`);
+    console.log(`[peer ${socketId}] ontrack ${track.kind} id=${track.id}`);
     const stream = peerStreams[socketId];
 
     stream.getTracks().filter(t => t.kind === track.kind).forEach(t => stream.removeTrack(t));
     stream.addTrack(track);
     if (track.kind === 'audio') track.enabled = true;
 
-    track.onmute = () => {
-      console.log(`[peer ${socketId}] track muted ${track.kind}`);
-    };
-    track.onunmute = () => {
-      console.log(`[peer ${socketId}] track unmuted ${track.kind}`);
-      refreshTileVideo(socketId, stream);
-    };
-    track.onended = () => {
-      console.log(`[peer ${socketId}] track ended ${track.kind}`);
-      stream.removeTrack(track);
-      refreshTileVideo(socketId, stream);
-    };
+    track.onmute   = () => console.log(`[peer ${socketId}] track muted   ${track.kind}`);
+    track.onunmute = () => refreshTileVideo(socketId, stream);
+    track.onended  = () => { stream.removeTrack(track); refreshTileVideo(socketId, stream); };
 
     refreshTileVideo(socketId, stream, track);
     updateGridLayout();
@@ -436,6 +510,7 @@ async function createPeer(socketId, initiator) {
   return pc;
 }
 
+// FIX: null → reassign forces browser to re-render with new/replaced track
 function refreshTileVideo(socketId, stream, newTrack) {
   const tile = document.getElementById(`tile-${socketId}`);
   if (!tile) { addRemoteTile(socketId, stream); return; }
@@ -444,8 +519,7 @@ function refreshTileVideo(socketId, stream, newTrack) {
 
   vid.srcObject = null;
   vid.srcObject = stream;
-  vid.muted  = false;
-  vid.volume = 1.0;
+  vid.muted = false; vid.volume = 1.0;
   safePlay(vid);
 
   if (newTrack?.kind === 'video' || stream.getVideoTracks().length > 0) {
@@ -453,12 +527,13 @@ function refreshTileVideo(socketId, stream, newTrack) {
     if (ph) ph.classList.add('hidden');
   }
 
-  if (focusedPeer === socketId && focusVideo) {
-    focusVideo.srcObject = null;
-    focusVideo.srcObject = stream;
-    focusVideo.muted  = false;
-    focusVideo.volume = 1.0;
-    safePlay(focusVideo);
+  // Also refresh focus overlay if this peer is focused
+  const fv = focusVideo();
+  if (focusedPeer === socketId && fv) {
+    fv.srcObject = null;
+    fv.srcObject = stream;
+    fv.muted = false; fv.volume = 1.0;
+    safePlay(fv);
   }
 }
 
@@ -467,7 +542,6 @@ function removePeer(socketId) {
   delete peerStreams[socketId];
   const tile = document.getElementById(`tile-${socketId}`);
   if (tile) tile.remove();
-  // Remove from host panel
   document.getElementById(`hc-row-${socketId}`)?.remove();
   updateGridLayout();
   updateParticipantCount();
@@ -475,6 +549,7 @@ function removePeer(socketId) {
 
 // ── Remote tile ───────────────────────────────────────────────
 function addRemoteTile(socketId, stream) {
+  // FIX: strict guard — never create duplicate tiles
   if (document.getElementById(`tile-${socketId}`)) return;
   const name    = peerNames[socketId] || 'Participant';
   const initial = name.charAt(0).toUpperCase();
@@ -507,12 +582,9 @@ function addRemoteTile(socketId, stream) {
       <div class="avatar-circle">${escapeHtml(initial)}</div>
     </div>`;
 
-  // Add host crown if this is the host
   if (socketId === hostSocketId) {
     const crown = document.createElement('div');
-    crown.className = 'host-crown';
-    crown.title = 'Host';
-    crown.textContent = '👑';
+    crown.className = 'host-crown'; crown.title = 'Host'; crown.textContent = '👑';
     tile.appendChild(crown);
   }
 
@@ -525,31 +597,32 @@ function addRemoteTile(socketId, stream) {
       tile.querySelector('.no-video-placeholder').classList.add('hidden');
     }
   }
-  videoGrid.appendChild(tile);
+  videoGrid().appendChild(tile);
   updateGridLayout();
 }
 
-// ── Focus overlay ─────────────────────────────────────────────
+// ── Focus overlay (fullscreen shared screen) ──────────────────
 function openFocusOverlay(socketId) {
   const stream = peerStreams[socketId];
   if (!stream) return;
   focusedPeer = socketId;
   const name = peerNames[socketId] || 'Participant';
-  focusName.textContent = name + ' — Screen Share';
+  focusName().textContent = name + ' — Screen Share';
 
-  focusVideo.srcObject = null;
-  focusVideo.srcObject = stream;
-  focusVideo.muted  = false;
-  focusVideo.volume = 1.0;
-  safePlay(focusVideo);
+  const fv = focusVideo();
+  fv.srcObject = null;
+  fv.srcObject = stream;
+  fv.muted = false; fv.volume = 1.0;
+  safePlay(fv);
 
-  focusOverlay.classList.remove('hidden');
+  focusOverlay().classList.remove('hidden');
 }
 
 function closeFocusOverlay() {
   focusedPeer = null;
-  focusOverlay.classList.add('hidden');
-  focusVideo.srcObject = null;
+  focusOverlay().classList.add('hidden');
+  const fv = focusVideo();
+  if (fv) fv.srcObject = null;
 }
 
 // ── Tile min/max ──────────────────────────────────────────────
@@ -582,7 +655,80 @@ function toggleLocalTile() {
 function safePlay(videoEl) {
   const p = videoEl.play();
   if (p) p.catch(err => {
-    if (err.name === 'NotAllowedError') document.getElementById('audio-banner').classList.remove('hidden');
+    if (err.name === 'NotAllowedError') document.getElementById('audio-banner')?.classList.remove('hidden');
+  });
+}
+
+// ── FIX: Draggable PiP panel ──────────────────────────────────
+function initDraggablePip() {
+  const pip    = document.getElementById('screen-preview');
+  const handle = document.getElementById('screen-preview-drag-handle');
+  if (!pip || !handle) return;
+
+  let dragging = false, startX, startY, origLeft, origTop;
+
+  handle.addEventListener('mousedown', e => {
+    if (e.target.closest('button')) return; // don't drag if clicking a button
+    dragging = true;
+    // Convert current right/bottom to left/top for drag math
+    const rect = pip.getBoundingClientRect();
+    pip.style.right  = 'auto';
+    pip.style.bottom = 'auto';
+    pip.style.left   = rect.left + 'px';
+    pip.style.top    = rect.top  + 'px';
+    startX  = e.clientX;
+    startY  = e.clientY;
+    origLeft = rect.left;
+    origTop  = rect.top;
+    pip.style.transition = 'none';
+    e.preventDefault();
+  });
+
+  document.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    const dx = e.clientX - startX;
+    const dy = e.clientY - startY;
+    let newLeft = origLeft + dx;
+    let newTop  = origTop  + dy;
+    // Clamp within viewport
+    newLeft = Math.max(0, Math.min(newLeft, window.innerWidth  - pip.offsetWidth));
+    newTop  = Math.max(0, Math.min(newTop,  window.innerHeight - pip.offsetHeight));
+    pip.style.left = newLeft + 'px';
+    pip.style.top  = newTop  + 'px';
+  });
+
+  document.addEventListener('mouseup', () => {
+    if (dragging) { dragging = false; pip.style.transition = ''; }
+  });
+
+  // Touch support
+  handle.addEventListener('touchstart', e => {
+    if (e.target.closest('button')) return;
+    const touch = e.touches[0];
+    const rect  = pip.getBoundingClientRect();
+    pip.style.right  = 'auto';
+    pip.style.bottom = 'auto';
+    pip.style.left   = rect.left + 'px';
+    pip.style.top    = rect.top  + 'px';
+    startX = touch.clientX; startY = touch.clientY;
+    origLeft = rect.left;   origTop  = rect.top;
+    dragging = true;
+    pip.style.transition = 'none';
+  }, { passive: true });
+
+  document.addEventListener('touchmove', e => {
+    if (!dragging) return;
+    const touch = e.touches[0];
+    let newLeft = origLeft + (touch.clientX - startX);
+    let newTop  = origTop  + (touch.clientY - startY);
+    newLeft = Math.max(0, Math.min(newLeft, window.innerWidth  - pip.offsetWidth));
+    newTop  = Math.max(0, Math.min(newTop,  window.innerHeight - pip.offsetHeight));
+    pip.style.left = newLeft + 'px';
+    pip.style.top  = newTop  + 'px';
+  }, { passive: true });
+
+  document.addEventListener('touchend', () => {
+    if (dragging) { dragging = false; pip.style.transition = ''; }
   });
 }
 
@@ -594,19 +740,16 @@ setInterval(() => {
     const tile = document.getElementById(`tile-${socketId}`);
     if (!tile) return;
     const vid = tile.querySelector('video');
-    if (!vid || !vid.srcObject) {
-      vid.srcObject = stream;
-      safePlay(vid);
+    if (!vid) return;
+    if (!vid.srcObject) {
+      vid.srcObject = stream; safePlay(vid);
     } else if (vid.readyState === 0 && stream.getVideoTracks().length > 0) {
-      vid.srcObject = null;
-      vid.srcObject = stream;
-      safePlay(vid);
+      vid.srcObject = null; vid.srcObject = stream; safePlay(vid);
     }
-    if (focusedPeer === socketId && focusVideo) {
-      if (!focusVideo.srcObject || focusVideo.readyState === 0) {
-        focusVideo.srcObject = null;
-        focusVideo.srcObject = stream;
-        safePlay(focusVideo);
+    const fv = focusVideo();
+    if (focusedPeer === socketId && fv) {
+      if (!fv.srcObject || fv.readyState === 0) {
+        fv.srcObject = null; fv.srcObject = stream; safePlay(fv);
       }
     }
   });
@@ -614,12 +757,15 @@ setInterval(() => {
 
 // ── Grid ──────────────────────────────────────────────────────
 function updateGridLayout() {
-  const count = videoGrid.children.length;
-  videoGrid.setAttribute('data-count', Math.min(count, 6));
+  const grid = videoGrid();
+  if (!grid) return;
+  const count = grid.children.length;
+  grid.setAttribute('data-count', Math.min(count, 6));
 }
 function updateParticipantCount() {
   const n = Object.keys(peers).length + 1;
-  participantCount.textContent = n === 1 ? '1 participant' : `${n} participants`;
+  const el = participantCount();
+  if (el) el.textContent = n === 1 ? '1 participant' : `${n} participants`;
 }
 
 // ── Mic / Camera ──────────────────────────────────────────────
@@ -635,18 +781,20 @@ function toggleCamera() {
   if (!localStream) return;
   camEnabled = !camEnabled;
   localStream.getVideoTracks().forEach(t => t.enabled = camEnabled);
-  localPlaceholder.classList.toggle('hidden', camEnabled);
+  localPlaceholder().classList.toggle('hidden', camEnabled);
   syncBtnUI();
   socket.emit('media-state', { roomId: ROOM_ID, video: camEnabled, audio: micEnabled, screen: isScreenSharing });
 }
 function syncBtnUI() {
   const mb = document.getElementById('mic-btn');
+  if (!mb) return;
   mb.querySelector('.icon-on').classList.toggle('hidden', !micEnabled);
   mb.querySelector('.icon-off').classList.toggle('hidden', micEnabled);
   mb.classList.toggle('off', !micEnabled);
   mb.querySelector('span').textContent = micEnabled ? 'Mute' : 'Unmute';
 
   const cb = document.getElementById('cam-btn');
+  if (!cb) return;
   cb.querySelector('.icon-on').classList.toggle('hidden', !camEnabled);
   cb.querySelector('.icon-off').classList.toggle('hidden', camEnabled);
   cb.classList.toggle('off', !camEnabled);
@@ -678,28 +826,30 @@ async function startScreenShare() {
     const vs = pc.getSenders().find(s => s.track?.kind === 'video');
     if (vs) {
       try { await vs.replaceTrack(screenTrack); }
-      catch (e) { pc.addTrack(screenTrack, screenStream); }
+      catch { pc.addTrack(screenTrack, screenStream); }
     } else {
       pc.addTrack(screenTrack, screenStream);
     }
   }));
 
-  screenPreviewVid.srcObject = screenStream;
-  screenPreviewVid.muted = true;
-  screenPreviewVid.play().catch(()=>{});
-  screenPreview.classList.remove('hidden', 'minimized');
+  const spv = screenPreviewVid();
+  spv.srcObject = screenStream; spv.muted = true; spv.play().catch(()=>{});
 
-  localVideo.srcObject = screenStream;
-  localVideo.muted = true;
-  localVideo.style.transform = 'none';
-  localPlaceholder.classList.add('hidden');
+  // FIX: reset PiP position to default (top-right, away from chat)
+  const pip = screenPreview();
+  pip.style.left = ''; pip.style.top = '';
+  pip.style.right = '20px'; pip.style.bottom = 'calc(var(--ctrl-bar) + 16px)';
+  pip.classList.remove('hidden', 'minimized');
+
+  const lv = localVideo();
+  lv.srcObject = screenStream; lv.muted = true; lv.style.transform = 'none';
+  localPlaceholder().classList.add('hidden');
 
   const localTile = document.getElementById('local-tile');
   localTile.classList.add('screenshare-tile');
   if (!localTile.querySelector('.screenshare-label')) {
     const lbl = document.createElement('div');
-    lbl.className = 'screenshare-label';
-    lbl.textContent = '🖥 You are presenting';
+    lbl.className = 'screenshare-label'; lbl.textContent = '🖥 You are presenting';
     localTile.appendChild(lbl);
   }
 
@@ -728,18 +878,19 @@ function stopScreenShare() {
     if (vs) vs.replaceTrack(camTrack).catch(()=>{});
   });
 
+  const lv = localVideo();
   if (localStream) {
-    localVideo.srcObject = localStream;
-    localVideo.style.transform = '';
-    localPlaceholder.classList.toggle('hidden', camEnabled);
+    lv.srcObject = localStream; lv.style.transform = '';
+    localPlaceholder().classList.toggle('hidden', camEnabled);
   }
 
   const localTile = document.getElementById('local-tile');
   localTile.classList.remove('screenshare-tile');
   localTile.querySelector('.screenshare-label')?.remove();
 
-  screenPreview.classList.add('hidden');
-  screenPreviewVid.srcObject = null;
+  const pip = screenPreview();
+  pip.classList.add('hidden');
+  screenPreviewVid().srcObject = null;
 
   const btn = document.getElementById('screen-btn');
   btn.classList.remove('active');
@@ -752,10 +903,9 @@ function stopScreenShare() {
   showToast('Screen sharing stopped');
 }
 
-// ── PiP ───────────────────────────────────────────────────────
 function toggleScreenPreview() {
   screenMinimized = !screenMinimized;
-  screenPreview.classList.toggle('minimized', screenMinimized);
+  screenPreview().classList.toggle('minimized', screenMinimized);
   const btn = document.getElementById('screen-preview-toggle');
   btn.title = screenMinimized ? 'Maximize' : 'Minimize';
   btn.innerHTML = screenMinimized
@@ -766,20 +916,20 @@ function toggleScreenPreview() {
 // ── Chat ──────────────────────────────────────────────────────
 function toggleChat() {
   chatOpen = !chatOpen;
-  chatPanel.classList.toggle('open', chatOpen);
+  chatPanel().classList.toggle('open', chatOpen);
   document.getElementById('chat-btn').classList.toggle('active', chatOpen);
   if (chatOpen) {
     unreadCount = 0;
-    chatBadge.classList.add('hidden');
-    chatInput.focus();
-    chatMessages.scrollTop = chatMessages.scrollHeight;
+    chatBadge().classList.add('hidden');
+    chatInput().focus();
+    chatMessages().scrollTop = chatMessages().scrollHeight;
   }
 }
 function sendMessage() {
-  const msg = chatInput.value.trim();
+  const msg = chatInput().value.trim();
   if (!msg) return;
   socket.emit('chat-message', { roomId: ROOM_ID, message: msg, userName: USER_NAME });
-  chatInput.value = '';
+  chatInput().value = '';
 }
 function appendMessage(userName, message, time, isOwn) {
   const div = document.createElement('div');
@@ -790,25 +940,30 @@ function appendMessage(userName, message, time, isOwn) {
       <span class="chat-msg-time">${time}</span>
     </div>
     <div class="chat-msg-body">${escapeHtml(message)}</div>`;
-  chatMessages.appendChild(div);
-  chatMessages.scrollTop = chatMessages.scrollHeight;
+  chatMessages().appendChild(div);
+  chatMessages().scrollTop = chatMessages().scrollHeight;
 }
 function addSystemMessage(text) {
+  const cm = chatMessages();
+  if (!cm) return;
   const div = document.createElement('div');
   div.className = 'chat-system';
   div.textContent = text;
-  chatMessages.appendChild(div);
-  chatMessages.scrollTop = chatMessages.scrollHeight;
+  cm.appendChild(div);
+  cm.scrollTop = cm.scrollHeight;
 }
-chatInput.addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+document.addEventListener('keydown', e => {
+  const ci = chatInput();
+  if (ci && document.activeElement === ci && e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault(); sendMessage();
+  }
 });
 
 function forceUnlockAudio() {
   document.querySelectorAll('.video-tile:not(.local-tile) video').forEach(v => {
     v.muted = false; v.volume = 1.0; v.play().catch(()=>{});
   });
-  document.getElementById('audio-banner').classList.add('hidden');
+  document.getElementById('audio-banner')?.classList.add('hidden');
   showToast('Audio enabled!');
   audioUnlocked = true;
 }
@@ -824,22 +979,26 @@ function leaveRoom() {
 function copyRoomId() { navigator.clipboard.writeText(ROOM_ID).then(() => showToast('Meeting ID copied!')); }
 function copyLink()   { navigator.clipboard.writeText(window.location.href).then(() => showToast('Link copied!')); }
 
-setInterval(() => {
-  const s  = Math.floor((Date.now() - startTime) / 1000);
-  const mm = String(Math.floor(s / 60)).padStart(2,'0');
-  const ss = String(s % 60).padStart(2,'0');
-  document.getElementById('meeting-time').textContent = `${mm}:${ss}`;
-}, 1000);
+function startTimer() {
+  startTime = Date.now();
+  setInterval(() => {
+    const s  = Math.floor((Date.now() - startTime) / 1000);
+    const mm = String(Math.floor(s / 60)).padStart(2,'0');
+    const ss = String(s % 60).padStart(2,'0');
+    const el = document.getElementById('meeting-time');
+    if (el) el.textContent = `${mm}:${ss}`;
+  }, 1000);
+}
 
 let toastTimer;
 function showToast(msg) {
   const t = document.getElementById('toast');
+  if (!t) return;
   t.textContent = msg; t.classList.add('show');
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => t.classList.remove('show'), 2600);
 }
-function escapeHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
 
-init();
+function escapeHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
