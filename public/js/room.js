@@ -31,12 +31,33 @@ let admitQueue      = [];      // queue of waiting requests
 
 const ICE_SERVERS = {
   iceServers: [
+    // ── STUN (fast path, works ~70% of the time) ──────────────
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun2.l.google.com:19302' },
-    { urls: 'stun:stun3.l.google.com:19302' },
-    { urls: 'stun:stun4.l.google.com:19302' },
-  ]
+    // ── TURN via UDP (preferred — low latency) ─────────────────
+    {
+      urls: 'turn:openrelay.metered.ca:80',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    },
+    // ── TURN via TCP port 80 (bypasses most firewalls) ─────────
+    {
+      urls: 'turn:openrelay.metered.ca:80?transport=tcp',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    },
+    // ── TURN over TLS port 443 (works even behind strict ISPs) ─
+    {
+      urls: 'turns:openrelay.metered.ca:443?transport=tcp',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    },
+  ],
+  iceCandidatePoolSize: 10,          // pre-gather candidates → faster connection
+  iceTransportPolicy: 'all',         // try STUN first, fall back to TURN automatically
+  bundlePolicy: 'max-bundle',        // bundle audio+video on one connection
+  rtcpMuxPolicy: 'require',          // reduce port usage
 };
 
 // ── DOM refs (only accessed after room-ui is shown) ───────────
@@ -581,11 +602,46 @@ async function createPeer(socketId, initiator) {
   };
 
   // ICE connection state for transport-level failures
+  let iceRestartCount = 0;
   pc.oniceconnectionstatechange = () => {
-    console.log(`[peer ${socketId}] ice: ${pc.iceConnectionState}`);
-    if (pc.iceConnectionState === 'failed') {
-      console.warn(`[peer ${socketId}] ICE failed — attempting restart`);
-      pc.restartIce();
+    const state = pc.iceConnectionState;
+    console.log(`[peer ${socketId}] ice: ${state}`);
+
+    if (state === 'connected' || state === 'completed') {
+      iceRestartCount = 0; // reset on success
+      // Log which candidate pair is in use (helps debug STUN vs TURN)
+      pc.getStats().then(stats => {
+        stats.forEach(report => {
+          if (report.type === 'candidate-pair' && report.state === 'succeeded' && report.nominated) {
+            console.log(`[peer ${socketId}] active pair — local: ${report.localCandidateId}, remote: ${report.remoteCandidateId}`);
+          }
+          if (report.type === 'local-candidate') {
+            console.log(`[peer ${socketId}] local candidate type: ${report.candidateType} (relay = TURN)`);
+          }
+        });
+      }).catch(() => {});
+    }
+
+    if (state === 'failed') {
+      iceRestartCount++;
+      if (iceRestartCount <= 3) {
+        console.warn(`[peer ${socketId}] ICE failed — restart attempt ${iceRestartCount}/3`);
+        pc.restartIce();
+      } else {
+        console.error(`[peer ${socketId}] ICE failed after 3 restarts — giving up`);
+        removePeer(socketId);
+        showToast('Connection lost with a participant. They may need to rejoin.');
+      }
+    }
+
+    if (state === 'disconnected') {
+      // Give it 5 seconds to self-recover before forcing a restart
+      setTimeout(() => {
+        if (pc.iceConnectionState === 'disconnected') {
+          console.warn(`[peer ${socketId}] Still disconnected after 5s — restarting ICE`);
+          pc.restartIce();
+        }
+      }, 5000);
     }
   };
 
