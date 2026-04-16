@@ -13,7 +13,6 @@ app.set('views', path.join(__dirname, 'views'));
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
 
-// In-memory room store
 // rooms[roomId] = { participants:[], host:null, originalHostName:null, createdAt, waiting:[] }
 // waiting entry: { socketId, userName, resolve }
 const rooms = {};
