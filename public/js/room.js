@@ -8,6 +8,7 @@
 const socket = io();
 const peers       = {};
 const peerStreams  = {};
+const peerTracks   = {}; // { socketId: { video: track, audio: track } }
 const peerNames   = {};
 
 let USER_NAME       = '';   // set after gate
@@ -250,7 +251,7 @@ socket.on('user-left', ({ socketId, userName }) => {
 });
 
 socket.on('chat-message', ({ userName, message, socketId: sid }) => {
-  const time = new Date().toLocaleTimeString(navigator.language || 'en', { hour: '2-digit', minute: '2-digit', hour12: true });
+  const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   appendMessage(userName, message, time, sid === socket.id);
   if (!chatOpen) {
     unreadCount++;
@@ -270,8 +271,7 @@ socket.on('peer-media-state', ({ socketId, video, audio, screen }) => {
   if (ph) ph.classList.toggle('hidden', !!(video || screen));
 
   const expandBtn = tile.querySelector('.tile-action-expand');
-  // Always show expand button so users can tap to fullscreen any tile
-  if (expandBtn) expandBtn.classList.remove('hidden');
+  if (expandBtn) expandBtn.classList.remove('hidden'); // always visible
 
   let label = tile.querySelector('.screenshare-label');
   if (screen) {
@@ -282,8 +282,8 @@ socket.on('peer-media-state', ({ socketId, video, audio, screen }) => {
       label.textContent = '🖥 Presenting';
       tile.appendChild(label);
     }
-    // Small delay to let the video track settle before opening focus overlay
-    setTimeout(() => openFocusOverlay(socketId), 300);
+    // Wait for ontrack to fire and store the new track, then open focus
+    setTimeout(() => openFocusOverlay(socketId), 500);
   } else {
     tile.classList.remove('screenshare-tile');
     if (label) label.remove();
@@ -538,9 +538,17 @@ async function createPeer(socketId, initiator) {
     stream.addTrack(track);
     if (track.kind === 'audio') track.enabled = true;
 
+    // Store raw track reference so we can build fresh MediaStreams on demand
+    if (!peerTracks[socketId]) peerTracks[socketId] = {};
+    peerTracks[socketId][track.kind] = track;
+
     track.onmute   = () => console.log(`[peer ${socketId}] track muted   ${track.kind}`);
     track.onunmute = () => refreshTileVideo(socketId, stream);
-    track.onended  = () => { stream.removeTrack(track); refreshTileVideo(socketId, stream); };
+    track.onended  = () => {
+      stream.removeTrack(track);
+      if (peerTracks[socketId]) delete peerTracks[socketId][track.kind];
+      refreshTileVideo(socketId, stream);
+    };
 
     refreshTileVideo(socketId, stream, track);
     updateGridLayout();
@@ -556,26 +564,37 @@ async function createPeer(socketId, initiator) {
   return pc;
 }
 
-// FIX: null → reassign forces browser to re-render with new/replaced track
+function buildFreshStream(socketId) {
+  // Always create a brand-new MediaStream object from stored tracks.
+  // Reusing the same MediaStream reference causes mobile Chrome/WebView to
+  // show black video because the decoder ignores srcObject reassignment
+  // when the object identity hasn't changed.
+  const ms = new MediaStream();
+  const tracks = peerTracks[socketId];
+  if (tracks) {
+    if (tracks.video && tracks.video.readyState !== 'ended') ms.addTrack(tracks.video);
+    if (tracks.audio && tracks.audio.readyState !== 'ended') ms.addTrack(tracks.audio);
+  } else {
+    // Fallback: use peerStreams tracks
+    const s = peerStreams[socketId];
+    if (s) s.getTracks().forEach(t => ms.addTrack(t));
+  }
+  return ms;
+}
+
 function refreshTileVideo(socketId, stream, newTrack) {
-  // Don't create/refresh tiles for peers that are no longer tracked
   if (!peers[socketId] && !peerNames[socketId]) return;
   const tile = document.getElementById(`tile-${socketId}`);
   if (!tile) { addRemoteTile(socketId, stream); return; }
   const vid = tile.querySelector('video');
   if (!vid) return;
 
-  // CRITICAL FIX: always build a fresh MediaStream — reusing the same mutated
-  // stream object causes mobile browsers (Chrome/WebView) to show black video
-  // because the decoder does not detect the track change on the same reference.
-  const freshStream = new MediaStream();
-  stream.getTracks().forEach(t => freshStream.addTrack(t));
-
+  // Build a fresh MediaStream — critical for mobile to detect the track change
+  const fresh = buildFreshStream(socketId);
   vid.pause();
   vid.srcObject = null;
-  // One rAF tick so the browser fully releases the old decoder before attaching new
   requestAnimationFrame(() => {
-    vid.srcObject = freshStream;
+    vid.srcObject = fresh;
     vid.muted = false;
     vid.volume = 1.0;
     safePlay(vid);
@@ -586,27 +605,16 @@ function refreshTileVideo(socketId, stream, newTrack) {
     if (ph) ph.classList.add('hidden');
   }
 
-  // Also refresh focus overlay if this peer is focused
-  const fv = focusVideo();
-  if (focusedPeer === socketId && fv) {
-    fv.pause();
-    fv.srcObject = null;
-    requestAnimationFrame(() => {
-      const s2 = peerStreams[socketId];
-      if (!s2) return;
-      const ms2 = new MediaStream();
-      s2.getTracks().forEach(t => ms2.addTrack(t));
-      fv.srcObject = ms2;
-      fv.muted = false;
-      fv.volume = 1.0;
-      safePlay(fv);
-    });
+  // Refresh focus overlay if this peer is currently focused
+  if (focusedPeer === socketId) {
+    openFocusOverlay(socketId);
   }
 }
 
 function removePeer(socketId) {
   if (peers[socketId]) { peers[socketId].close(); delete peers[socketId]; }
   delete peerStreams[socketId];
+  delete peerTracks[socketId];
   delete peerNames[socketId];
   const tile = document.getElementById(`tile-${socketId}`);
   if (tile) tile.remove();
@@ -644,7 +652,7 @@ function addRemoteTile(socketId, stream) {
   tile.innerHTML = `
     <video autoplay playsinline></video>
     <div class="tile-controls">
-      <button class="tile-action-btn tile-action-expand" onclick="openFocusOverlay('${socketId}')" title="Fullscreen">
+      <button class="tile-action-btn tile-action-expand hidden" onclick="openFocusOverlay('${socketId}')" title="Expand screen">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
       </button>
       <button class="tile-action-btn tile-action-min" onclick="minimizeTile('${socketId}')" title="Minimize">
@@ -672,23 +680,24 @@ function addRemoteTile(socketId, stream) {
     tile.appendChild(crown);
   }
 
-  // Tap tile to fullscreen (works on mobile without needing to hit small button)
-  tile.addEventListener('dblclick', () => openFocusOverlay(socketId));
-  // Single tap on video area opens focus on mobile
-  let tapTimer = null;
+  // Tap tile to fullscreen on mobile (double-tap or single tap on video area)
+  let _tapTimer = null;
   tile.addEventListener('click', e => {
-    if (e.target.closest('button')) return; // don't trigger on button clicks
-    if (tapTimer) { clearTimeout(tapTimer); tapTimer = null; openFocusOverlay(socketId); return; }
-    tapTimer = setTimeout(() => { tapTimer = null; }, 300);
+    if (e.target.closest('button')) return;
+    if (_tapTimer) { clearTimeout(_tapTimer); _tapTimer = null; openFocusOverlay(socketId); return; }
+    _tapTimer = setTimeout(() => { _tapTimer = null; }, 280);
+  });
+  tile.addEventListener('dblclick', e => {
+    if (e.target.closest('button')) return;
+    openFocusOverlay(socketId);
   });
 
   const vid = tile.querySelector('video');
   vid.volume = 1.0;
   if (stream?.getTracks().length > 0) {
-    // Fresh MediaStream on initial attach too — consistent with refresh pattern
-    const initStream = new MediaStream();
-    stream.getTracks().forEach(t => initStream.addTrack(t));
-    vid.srcObject = initStream;
+    const initFresh = new MediaStream();
+    stream.getTracks().forEach(t => initFresh.addTrack(t));
+    vid.srcObject = initFresh;
     safePlay(vid);
     if (stream.getVideoTracks().length > 0) {
       tile.querySelector('.no-video-placeholder').classList.add('hidden');
@@ -700,37 +709,25 @@ function addRemoteTile(socketId, stream) {
 
 // ── Focus overlay (fullscreen shared screen) ──────────────────
 function openFocusOverlay(socketId) {
-  const stream = peerStreams[socketId];
-  if (!stream) return;
+  if (!peerStreams[socketId] && !peerTracks[socketId]) return;
   focusedPeer = socketId;
   const name = peerNames[socketId] || 'Participant';
-  // Show "Screen Share" label only when actually screen sharing, otherwise just name
   const tile = document.getElementById(`tile-${socketId}`);
   const isSharing = tile && tile.classList.contains('screenshare-tile');
   focusName().textContent = name + (isSharing ? ' — Screen Share' : '');
 
   const fv = focusVideo();
-  // Force detach first — critical for mobile to re-render video
   fv.pause();
   fv.srcObject = null;
 
-  // Small tick so browser releases old track before attaching new one
-  setTimeout(() => {
-    const freshStream = peerStreams[socketId];
-    if (!freshStream) return;
-    // On mobile, getVideoTracks()[0] may be the screen track — attach directly
-    const videoTrack = freshStream.getVideoTracks()[0];
-    if (videoTrack) {
-      const ms = new MediaStream();
-      freshStream.getTracks().forEach(t => ms.addTrack(t));
-      fv.srcObject = ms;
-    } else {
-      fv.srcObject = freshStream;
-    }
+  // Use rAF + fresh stream so mobile GPU decoder fully reinitialises
+  requestAnimationFrame(() => {
+    const fresh = buildFreshStream(socketId);
+    fv.srcObject = fresh;
     fv.muted = false;
     fv.volume = 1.0;
     safePlay(fv);
-  }, 80);
+  });
 
   focusOverlay().classList.remove('hidden');
 }
@@ -858,19 +855,15 @@ setInterval(() => {
     if (!tile) return;
     const vid = tile.querySelector('video');
     if (!vid) return;
-    const needsRefresh = !vid.srcObject || (vid.readyState === 0 && stream.getVideoTracks().length > 0);
-    if (needsRefresh) {
-      const hs = new MediaStream(); stream.getTracks().forEach(t => hs.addTrack(t));
+    const needsFix = !vid.srcObject || (vid.readyState === 0 && stream.getVideoTracks().length > 0);
+    if (needsFix) {
+      const hfresh = buildFreshStream(socketId);
       vid.pause(); vid.srcObject = null;
-      requestAnimationFrame(() => { vid.srcObject = hs; safePlay(vid); });
+      requestAnimationFrame(() => { vid.srcObject = hfresh; safePlay(vid); });
     }
     const fv = focusVideo();
-    if (focusedPeer === socketId && fv) {
-      if (!fv.srcObject || fv.readyState === 0) {
-        const hf = new MediaStream(); stream.getTracks().forEach(t => hf.addTrack(t));
-        fv.pause(); fv.srcObject = null;
-        requestAnimationFrame(() => { fv.srcObject = hf; fv.muted = false; fv.volume = 1.0; safePlay(fv); });
-      }
+    if (focusedPeer === socketId && fv && (!fv.srcObject || fv.readyState === 0)) {
+      openFocusOverlay(socketId);
     }
   });
 }, 4000);
