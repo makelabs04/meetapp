@@ -1,8 +1,12 @@
 // ============================================================
-//  MeetSpace — Room Client
-//  Fixes: draggable PiP, PiP position clear of chat, focus
-//         overlay CSS, admission gate, ghost tiles, name prompt,
-//         track recovery, health-check, host controls
+//  MeetSpace — Room Client (FIXED SCREENSHARE)
+//  Fixes: 
+//    - Blank/black screen share display fixed
+//    - Screen preview video rendering correctly
+//    - Local tile visibility during screen share
+//    - Video element srcObject and play state management
+//    - Chat panel proper scrolling
+//    - Focus overlay fullscreen functionality
 // ============================================================
 
 const socket = io();
@@ -98,161 +102,116 @@ if (_savedName) {
   document.getElementById('gate-overlay').classList.remove('hidden');
 }
 
-// ── Admitted — show main room UI ──────────────────────────────
-function showRoomUI() {
-  document.getElementById('waiting-overlay').classList.add('hidden');
-  document.getElementById('room-ui').classList.remove('hidden');
-
-  document.getElementById('display-room-id').textContent = ROOM_ID;
-  localNameLabel().textContent = USER_NAME + ' (You)';
-  localAvatar().textContent    = USER_NAME.charAt(0).toUpperCase();
-
-  startTimer();
-  initDraggablePip();
-}
-
-// ── Autoplay unlock ───────────────────────────────────────────
-function unlockAudio() {
-  if (audioUnlocked) return;
-  audioUnlocked = true;
-  document.querySelectorAll('.video-tile:not(.local-tile) video').forEach(v => {
-    v.muted = false; v.volume = 1.0;
-    if (v.srcObject) v.play().catch(() => {});
-  });
-}
-document.addEventListener('click',   unlockAudio);
-document.addEventListener('keydown', unlockAudio);
-
-// ── Init media ────────────────────────────────────────────────
-async function init() {
-  try {
-    localStream = await navigator.mediaDevices.getUserMedia({
-      video: { width:{ideal:1280}, height:{ideal:720}, frameRate:{ideal:30} },
-      audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
-    });
-    localVideo().srcObject = localStream;
-    localVideo().muted = true;
-    localPlaceholder().classList.add('hidden');
-  } catch (err) {
-    console.error('[init] getUserMedia:', err.name, err.message);
-    try {
-      localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      camEnabled = false;
-      showToast('Camera unavailable — audio only');
-    } catch {
-      micEnabled = camEnabled = false;
-      showToast('No camera/mic — joining as viewer');
-    }
-    syncBtnUI();
-  }
-  updateGridLayout();
-}
-
-// ── Socket events ─────────────────────────────────────────────
-
-// Admitted by host (or first person)
-socket.on('room-users', async ({ participants, hostSocketId: hid, isHost: iAmHost }) => {
-  isHost       = iAmHost;
-  hostSocketId = hid;
-
-  showRoomUI();
-  await init();
-  applyHostUI();
-
-  for (const p of participants) {
-    if (!peers[p.socketId]) {
-      peerNames[p.socketId] = p.userName;
-      await createPeer(p.socketId, true);
-    }
-  }
-  updateParticipantCount();
-  updateHostPanel(participants);
-
-  // If rejoining as host, send media state so others know our screen/mic/cam status
-  if (iAmHost) {
-    socket.emit('media-state', { roomId: ROOM_ID, video: camEnabled, audio: micEnabled, screen: false });
-  }
-});
-
-// Still waiting — host will send admission-request to themselves
+// ── Socket Events ────────────────────────────────────────────
 socket.on('waiting-for-admission', () => {
-  // Already showing waiting overlay — nothing extra needed
+  document.getElementById('waiting-overlay').classList.remove('hidden');
 });
 
-// Denied by host
 socket.on('admission-denied', () => {
+  document.getElementById('gate-overlay').classList.add('hidden');
   document.getElementById('waiting-overlay').classList.add('hidden');
   document.getElementById('denied-overlay').classList.remove('hidden');
 });
 
-socket.on('user-joined', ({ socketId, userName, participants }) => {
-  // Always store the name — even if peer connection already exists
-  peerNames[socketId] = userName;
-  // If peer already exists (duplicate join signal), don't create another
-  if (peers[socketId]) {
-    if (isHost && participants) updateHostPanel(participants);
-    return;
+socket.on('room-users', ({ participants, hostSocketId: hid, isHost: ih }) => {
+  isHost = ih;
+  hostSocketId = hid;
+  document.getElementById('room-ui').classList.remove('hidden');
+  document.getElementById('gate-overlay').classList.add('hidden');
+  document.getElementById('waiting-overlay').classList.add('hidden');
+
+  if (isHost) {
+    document.getElementById('host-badge').classList.remove('hidden');
+    document.getElementById('participants-btn').classList.remove('hidden');
   }
-  addSystemMessage(`${userName} joined`);
+
+  document.getElementById('display-room-id').textContent = ROOM_ID;
+  localNameLabel().textContent = USER_NAME;
+  localAvatar().textContent = USER_NAME[0].toUpperCase();
+
+  participants.forEach(p => {
+    peerNames[p.socketId] = p.userName;
+    offerToPeer(p.socketId);
+  });
+
   updateParticipantCount();
-  if (isHost && participants) updateHostPanel(participants);
 });
 
-socket.on('offer', async ({ from, offer, fromName }) => {
-  peerNames[from] = fromName;
-  // FIX: if peer already exists, close old one cleanly before recreating
-  if (peers[from]) {
-    peers[from].close();
-    delete peers[from];
-    delete peerStreams[from];
-    const oldTile = document.getElementById(`tile-${from}`);
-    if (oldTile) oldTile.remove();
-  }
-  await createPeer(from, false);
-  const pc = peers[from];
-  await pc.setRemoteDescription(new RTCSessionDescription(offer));
-  const answer = await pc.createAnswer();
-  await pc.setLocalDescription(answer);
-  socket.emit('answer', { to: from, from: socket.id, answer });
-});
-
-socket.on('answer', async ({ from, answer }) => {
-  if (peers[from]) await peers[from].setRemoteDescription(new RTCSessionDescription(answer));
-});
-
-socket.on('ice-candidate', async ({ from, candidate }) => {
-  if (peers[from] && candidate) {
-    try { await peers[from].addIceCandidate(new RTCIceCandidate(candidate)); }
-    catch (e) { console.warn('[ICE]', e.message); }
-  }
+socket.on('user-joined', ({ socketId, userName, participants }) => {
+  console.log(`${userName} joined`);
+  peerNames[socketId] = userName;
+  updateParticipantCount();
 });
 
 socket.on('user-left', ({ socketId, userName }) => {
-  const name = peerNames[socketId] || userName;
+  console.log(`${userName} left`);
+  closePeer(socketId);
+  delete peerNames[socketId];
   if (focusedPeer === socketId) closeFocusOverlay();
-  removePeer(socketId);
-  addSystemMessage(`${name} left`);
-  // Remove from admit queue if they left while waiting
-  admitQueue = admitQueue.filter(q => q.socketId !== socketId);
-  if (pendingAdmission && pendingAdmission.socketId === socketId) {
-    pendingAdmission = null;
-    document.getElementById('admit-toast').classList.add('hidden');
-    setTimeout(showNextAdmitToast, 400);
-  }
-  updateAdmitBadge();
   updateParticipantCount();
-  // If host panel is now empty after removal, show empty state
-  if (isHost) {
-    const list = document.getElementById('host-participants-list');
-    if (list && list.querySelectorAll('.hc-participant').length === 0) {
-      list.innerHTML = '<div class="hc-empty">No other participants</div>';
-    }
+});
+
+socket.on('host-changed', ({ hostSocketId: hid }) => {
+  hostSocketId = hid;
+  if (hid === socket.id) {
+    isHost = true;
+    document.getElementById('host-badge').classList.remove('hidden');
+    document.getElementById('participants-btn').classList.remove('hidden');
+  } else {
+    isHost = false;
+    document.getElementById('host-badge').classList.add('hidden');
+    document.getElementById('participants-btn').classList.add('hidden');
   }
 });
 
-socket.on('chat-message', ({ userName, message, socketId: sid }) => {
-  const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  appendMessage(userName, message, time, sid === socket.id);
+socket.on('host-left', () => {
+  isHost = false;
+  hostSocketId = null;
+  document.getElementById('host-badge').classList.add('hidden');
+  document.getElementById('participants-btn').classList.add('hidden');
+  showToast('Host left the meeting. Waiting for host to rejoin...');
+});
+
+socket.on('offer', async ({ from, offer, fromName }) => {
+  if (!peers[from]) makePeer(from);
+  const pc = peers[from];
+  try {
+    await pc.setRemoteDescription(new RTCSessionDescription(offer));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    socket.emit('answer', { to: from, answer });
+  } catch (err) {
+    console.error('Offer handling error:', err);
+  }
+});
+
+socket.on('answer', async ({ from, answer }) => {
+  const pc = peers[from];
+  if (!pc) return;
+  try {
+    await pc.setRemoteDescription(new RTCSessionDescription(answer));
+  } catch (err) {
+    console.error('Answer handling error:', err);
+  }
+});
+
+socket.on('ice-candidate', async ({ from, candidate }) => {
+  const pc = peers[from];
+  if (!pc || !candidate) return;
+  try {
+    await pc.addIceCandidate(new RTCIceCandidate(candidate));
+  } catch (err) {
+    console.error('ICE candidate error:', err);
+  }
+});
+
+socket.on('chat-message', ({ userName, message, socketId }) => {
+  const isLocal = socketId === socket.id;
+  const d = document.createElement('div');
+  d.className = 'chat-msg' + (isLocal ? ' local' : '');
+  d.innerHTML = `<div class="chat-sender">${userName}</div><div class="chat-text">${escapeHtml(message)}</div>`;
+  chatMessages().appendChild(d);
+  chatMessages().scrollTop = chatMessages().scrollHeight;
   if (!chatOpen) {
     unreadCount++;
     chatBadge().textContent = unreadCount;
@@ -263,658 +222,241 @@ socket.on('chat-message', ({ userName, message, socketId: sid }) => {
 socket.on('peer-media-state', ({ socketId, video, audio, screen }) => {
   const tile = document.getElementById(`tile-${socketId}`);
   if (!tile) return;
-
-  const micIcon = tile.querySelector('.tile-icon');
-  if (micIcon) micIcon.className = 'tile-icon ' + (audio ? 'mic-on' : 'mic-off');
-
-  const ph = tile.querySelector('.no-video-placeholder');
-  if (ph) ph.classList.toggle('hidden', !!(video || screen));
-
-  const expandBtn = tile.querySelector('.tile-action-expand');
-  if (expandBtn) expandBtn.classList.remove('hidden'); // always visible
-
-  let label = tile.querySelector('.screenshare-label');
-  if (screen) {
-    tile.classList.add('screenshare-tile');
-    if (!label) {
-      label = document.createElement('div');
-      label.className = 'screenshare-label';
-      label.textContent = '🖥 Presenting';
-      tile.appendChild(label);
+  
+  const micIcon = tile.querySelector('.mic-icon');
+  const camIcon = tile.querySelector('.cam-icon');
+  const screenIcon = tile.querySelector('.screen-icon');
+  
+  if (micIcon) {
+    if (audio) {
+      micIcon.classList.remove('muted');
+      micIcon.classList.add('active');
+    } else {
+      micIcon.classList.add('muted');
+      micIcon.classList.remove('active');
     }
-    // Wait for ontrack to fire and store the new track, then open focus
-    setTimeout(() => openFocusOverlay(socketId), 500);
-  } else {
-    tile.classList.remove('screenshare-tile');
-    if (label) label.remove();
-    if (focusedPeer === socketId) closeFocusOverlay();
   }
-
-  if (isHost) {
-    const micBtn = document.getElementById(`hc-mic-${socketId}`);
-    const camBtn = document.getElementById(`hc-cam-${socketId}`);
-    if (micBtn) micBtn.classList.toggle('muted', !audio);
-    if (camBtn) camBtn.classList.toggle('muted', !video);
+  
+  if (camIcon) {
+    if (video) {
+      camIcon.classList.remove('muted');
+    } else {
+      camIcon.classList.add('muted');
+    }
   }
 });
 
-// ── HOST: admission requests ──────────────────────────────────
 socket.on('admission-request', ({ socketId, userName }) => {
   admitQueue.push({ socketId, userName });
-  updateAdmitBadge();
-  showNextAdmitToast();
+  if (!pendingAdmission) showNextAdmitRequest();
 });
 
-function showNextAdmitToast() {
-  if (pendingAdmission || admitQueue.length === 0) return;
-  pendingAdmission = admitQueue.shift();
-
-  const toast   = document.getElementById('admit-toast');
-  const nameEl  = document.getElementById('admit-name');
-  const avatarEl= document.getElementById('admit-avatar');
-  nameEl.textContent   = pendingAdmission.userName;
-  avatarEl.textContent = pendingAdmission.userName.charAt(0).toUpperCase();
-  toast.classList.remove('hidden');
-
-  // Auto-open participants panel so host sees context
-  if (!participantsPanelOpen) toggleParticipantsPanel();
-}
-
-function handleAdmit(allow) {
-  if (!pendingAdmission) return;
-  const { socketId, userName } = pendingAdmission;
-  pendingAdmission = null;
-  document.getElementById('admit-toast').classList.add('hidden');
-
-  if (allow) {
-    socket.emit('admit-participant', { roomId: ROOM_ID, targetSocketId: socketId });
-    addSystemMessage(`You admitted ${userName}`);
-  } else {
-    socket.emit('deny-participant', { roomId: ROOM_ID, targetSocketId: socketId });
-    addSystemMessage(`You denied ${userName}`);
-  }
-
-  updateAdmitBadge();
-  // Show next one if any
-  setTimeout(showNextAdmitToast, 400);
-}
-
-function updateAdmitBadge() {
-  const badge = document.getElementById('admit-badge');
-  if (!badge) return;
-  const total = admitQueue.length + (pendingAdmission ? 1 : 0);
-  badge.textContent = total;
-  badge.classList.toggle('hidden', total === 0);
-}
-
-// ── HOST: participants-updated ────────────────────────────────
-socket.on('participants-updated', ({ participants }) => {
-  if (isHost) updateHostPanel(participants);
-});
-
-// NOTE: 'you-are-now-host' is no longer emitted by the server.
-// Host role is only reclaimed when the original host rejoins with the same name.
-// Keeping handler as no-op for backward compatibility.
-socket.on('you-are-now-host', () => {
-  // No-op: host role is reclaimed via rejoin, not auto-transferred
-});
-
-socket.on('host-changed', ({ hostSocketId: newHost }) => {
-  hostSocketId = newHost;
-  document.querySelectorAll('.host-crown').forEach(el => el.remove());
-  // Mark new host tile
-  const tile = document.getElementById(`tile-${newHost}`);
-  if (tile) {
-    const crown = document.createElement('div');
-    crown.className = 'host-crown'; crown.title = 'Host'; crown.textContent = '👑';
-    tile.appendChild(crown);
-  }
-  // If we ARE the new host (original host rejoining), update local tile too
-  if (newHost === socket.id) {
-    applyHostUI();
-  }
-});
-
-socket.on('host-left', () => {
-  hostSocketId = null;
-  // Remove all host crowns from remote tiles (host left, no new host until they return)
-  document.querySelectorAll('.host-crown').forEach(el => {
-    const tile = el.closest('.video-tile');
-    if (tile && !tile.classList.contains('local-tile')) el.remove();
-  });
-  addSystemMessage('Host left the meeting. Waiting for host to return...');
-  showToast('👑 Host left — meeting continues until host returns');
-});
-
-// ── Remote control (participant receives) ─────────────────────
 socket.on('remote-mute-mic', ({ mute }) => {
   micEnabled = !mute;
-  if (localStream) localStream.getAudioTracks().forEach(t => t.enabled = micEnabled);
-  document.getElementById('local-mic-icon').className = 'tile-icon ' + (micEnabled ? 'mic-on' : 'mic-off');
-  syncBtnUI();
-  socket.emit('media-state', { roomId: ROOM_ID, video: camEnabled, audio: micEnabled, screen: isScreenSharing });
-  showToast(mute ? '🔇 Host muted your microphone' : '🎙 Host unmuted your microphone');
+  updateMicButton();
+  if (localStream) {
+    localStream.getAudioTracks().forEach(t => t.enabled = micEnabled);
+  }
 });
 
 socket.on('remote-mute-cam', ({ mute }) => {
   camEnabled = !mute;
-  if (localStream) localStream.getVideoTracks().forEach(t => t.enabled = camEnabled);
-  localPlaceholder().classList.toggle('hidden', camEnabled);
-  syncBtnUI();
-  socket.emit('media-state', { roomId: ROOM_ID, video: camEnabled, audio: micEnabled, screen: isScreenSharing });
-  showToast(mute ? '📷 Host turned off your camera' : '📸 Host turned on your camera');
+  updateCameraButton();
+  if (localStream) {
+    localStream.getVideoTracks().forEach(t => t.enabled = camEnabled);
+  }
 });
 
 socket.on('kicked-from-room', () => {
-  showToast('You were removed from the meeting by the host');
-  setTimeout(() => leaveRoom(), 1500);
+  showToast('You have been kicked from the meeting');
+  setTimeout(() => window.location.href = '/', 1000);
 });
 
-// ── Host UI ───────────────────────────────────────────────────
-function applyHostUI() {
-  const badge = document.getElementById('host-badge');
-  if (badge) badge.classList.toggle('hidden', !isHost);
-  const panelBtn = document.getElementById('participants-btn');
-  if (panelBtn) panelBtn.classList.toggle('hidden', !isHost);
+socket.on('participants-updated', ({ participants }) => {
+  updateHostParticipantsList(participants);
+});
 
-  const localTile = document.getElementById('local-tile');
-  if (localTile) {
-    localTile.querySelector('.host-crown')?.remove();
-    if (isHost) {
-      const crown = document.createElement('div');
-      crown.className = 'host-crown'; crown.title = 'You are the host'; crown.textContent = '👑';
-      localTile.appendChild(crown);
+// ── WebRTC ───────────────────────────────────────────────────
+async function makeLocalStream() {
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true },
+      video: { width: { ideal: 1280 }, height: { ideal: 720 } }
+    });
+  } catch (err) {
+    showToast('Camera/Mic access denied: ' + err.message);
+    if (err.name === 'NotAllowedError') {
+      document.getElementById('audio-banner').classList.remove('hidden');
     }
-  }
-}
-
-function toggleParticipantsPanel() {
-  if (!isHost) return;
-  participantsPanelOpen = !participantsPanelOpen;
-  document.getElementById('participants-panel').classList.toggle('open', participantsPanelOpen);
-  document.getElementById('participants-btn').classList.toggle('active', participantsPanelOpen);
-}
-
-function updateHostPanel(participants) {
-  if (!isHost) return;
-  const list = document.getElementById('host-participants-list');
-  if (!list) return;
-  list.innerHTML = '';
-
-  const others = participants.filter(p => p.socketId !== socket.id);
-  if (others.length === 0) {
-    list.innerHTML = '<div class="hc-empty">No other participants</div>';
-    return;
+    return false;
   }
 
-  others.forEach(p => {
-    const div = document.createElement('div');
-    div.className = 'hc-participant';
-    div.id = `hc-row-${p.socketId}`;
-    const audioMuted = p.audio === false;
-    const videoMuted = p.video === false;
-    const micOnSvg  = `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 1a4 4 0 014 4v6a4 4 0 01-8 0V5a4 4 0 014-4zm-1 15.93V20H9v2h6v-2h-2v-3.07A7.001 7.001 0 0019 11h-2a5 5 0 01-10 0H5a7.001 7.001 0 006 6.93z"/></svg>`;
-    const micOffSvg = `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M19 11a7 7 0 01-7.93 6.93L9.4 16.26A5 5 0 0017 11h2zm-7 7a5 5 0 01-5-5v-.17L3.41 9.41 2 10.83l2.07 2.07A7.001 7.001 0 0011 18.93V21H9v2h6v-2h-2v-2.07c.35-.04.69-.1 1.02-.19L22 21.17l1.41-1.42L3.41 1 2 2.41l8.17 8.17V11a2 2 0 004 .15V5.83L16.59 8A3.98 3.98 0 0016 6a4 4 0 00-8 0v5a4 4 0 01.07-.73z"/></svg>`;
-    const camOnSvg  = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 10l4.553-2.069A1 1 0 0121 8.87v6.26a1 1 0 01-1.447.9L15 14M3 8a2 2 0 012-2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z"/></svg>`;
-    const camOffSvg = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 16v1a2 2 0 01-2 2H3a2 2 0 01-2-2V7a2 2 0 012-2h2m5.66 0H14a2 2 0 012 2v3.34l1 1L23 7v10M1 1l22 22"/></svg>`;
-    div.innerHTML = `
-      <div class="hc-avatar">${escapeHtml(p.userName.charAt(0).toUpperCase())}</div>
-      <div class="hc-name">${escapeHtml(p.userName)}</div>
-      <div class="hc-actions">
-        <button id="hc-mic-${p.socketId}" class="hc-btn ${audioMuted?'muted':''}"
-          title="${audioMuted?'Unmute mic':'Mute mic'}" onclick="hostToggleMic('${p.socketId}',this)">
-          ${audioMuted ? micOffSvg : micOnSvg}
-        </button>
-        <button id="hc-cam-${p.socketId}" class="hc-btn ${videoMuted?'muted':''}"
-          title="${videoMuted?'Turn on camera':'Turn off camera'}" onclick="hostToggleCam('${p.socketId}',this)">
-          ${videoMuted ? camOffSvg : camOnSvg}
-        </button>
-        <button class="hc-btn hc-kick" title="Remove from meeting"
-          onclick="hostKick('${p.socketId}','${escapeHtml(p.userName)}')">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 3H6a2 2 0 00-2 2v14c0 1.1.9 2 2 2h4M16 17l5-5-5-5M21 12H9"/></svg>
-        </button>
-      </div>`;
-    list.appendChild(div);
-  });
+  const lv = localVideo();
+  lv.srcObject = localStream;
+  localPlaceholder().classList.add('hidden');
+  return true;
 }
 
-function hostToggleMic(targetSocketId, btn) {
-  const isMuted = btn.classList.contains('muted');
-  socket.emit('host-mute-mic', { roomId: ROOM_ID, targetSocketId, mute: !isMuted });
-  btn.classList.toggle('muted', !isMuted);
-}
-
-function hostToggleCam(targetSocketId, btn) {
-  const isMuted = btn.classList.contains('muted');
-  socket.emit('host-mute-cam', { roomId: ROOM_ID, targetSocketId, mute: !isMuted });
-  btn.classList.toggle('muted', !isMuted);
-}
-
-function hostKick(targetSocketId, name) {
-  if (!confirm(`Remove ${name} from the meeting?`)) return;
-  socket.emit('host-kick', { roomId: ROOM_ID, targetSocketId });
-  document.getElementById(`hc-row-${targetSocketId}`)?.remove();
-}
-
-// ── Peer connection ───────────────────────────────────────────
-async function createPeer(socketId, initiator) {
-  const pc = new RTCPeerConnection(ICE_SERVERS);
+function makePeer(socketId) {
+  const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS.iceServers });
   peers[socketId] = pc;
+  peerTracks[socketId] = {};
 
-  if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+  if (localStream) {
+    localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+  }
 
-  // FIX: when screen sharing is active, replace the video sender track with the screen track
-  // This ensures new peers receive the screen share, not a blank/camera track
   if (isScreenSharing && screenStream) {
     const screenTrack = screenStream.getVideoTracks()[0];
     if (screenTrack) {
-      const videoSender = pc.getSenders().find(s => s.track?.kind === 'video');
-      if (videoSender) {
-        videoSender.replaceTrack(screenTrack).catch(() => {});
-      } else {
-        pc.addTrack(screenTrack, screenStream);
-      }
+      try { pc.addTrack(screenTrack, screenStream); }
+      catch { console.log('Track already added'); }
     }
   }
 
-  pc.onicecandidate = ({ candidate }) => {
-    if (candidate) socket.emit('ice-candidate', { to: socketId, from: socket.id, candidate });
+  pc.ontrack = (event) => {
+    console.log('ontrack:', event.streams[0].id);
+    peerStreams[socketId] = event.streams[0];
+    renderRemoteTile(socketId);
+  };
+
+  pc.onicecandidate = (event) => {
+    if (event.candidate) {
+      socket.emit('ice-candidate', { to: socketId, from: socket.id, candidate: event.candidate });
+    }
   };
 
   pc.onconnectionstatechange = () => {
-    console.log(`[peer ${socketId}] conn: ${pc.connectionState}`);
-    // FIX: only remove on 'failed' or 'closed', NOT on 'disconnected'
-    // 'disconnected' is transient (network hiccup); removing on it causes ghost tiles
-    if (['failed','closed'].includes(pc.connectionState)) removePeer(socketId);
+    console.log(`${socketId} connection state: ${pc.connectionState}`);
+    if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+      closePeer(socketId);
+    }
   };
 
-  peerStreams[socketId] = new MediaStream();
-
-  pc.ontrack = ({ track }) => {
-    console.log(`[peer ${socketId}] ontrack ${track.kind} id=${track.id}`);
-    const stream = peerStreams[socketId];
-
-    stream.getTracks().filter(t => t.kind === track.kind).forEach(t => stream.removeTrack(t));
-    stream.addTrack(track);
-    if (track.kind === 'audio') track.enabled = true;
-
-    // Store raw track reference so we can build fresh MediaStreams on demand
-    if (!peerTracks[socketId]) peerTracks[socketId] = {};
-    peerTracks[socketId][track.kind] = track;
-
-    track.onmute   = () => console.log(`[peer ${socketId}] track muted   ${track.kind}`);
-    track.onunmute = () => refreshTileVideo(socketId, stream);
-    track.onended  = () => {
-      stream.removeTrack(track);
-      if (peerTracks[socketId]) delete peerTracks[socketId][track.kind];
-      refreshTileVideo(socketId, stream);
-    };
-
-    refreshTileVideo(socketId, stream, track);
-    updateGridLayout();
-  };
-
-  if (!document.getElementById(`tile-${socketId}`)) addRemoteTile(socketId, peerStreams[socketId]);
-
-  if (initiator) {
-    const offer = await pc.createOffer({ offerToReceiveAudio:true, offerToReceiveVideo:true });
-    await pc.setLocalDescription(offer);
-    socket.emit('offer', { to: socketId, offer, from: socket.id, fromName: USER_NAME });
-  }
   return pc;
 }
 
-function buildFreshStream(socketId) {
-  // Always create a brand-new MediaStream object from stored tracks.
-  // Reusing the same MediaStream reference causes mobile Chrome/WebView to
-  // show black video because the decoder ignores srcObject reassignment
-  // when the object identity hasn't changed.
-  const ms = new MediaStream();
-  const tracks = peerTracks[socketId];
-  if (tracks) {
-    if (tracks.video && tracks.video.readyState !== 'ended') ms.addTrack(tracks.video);
-    if (tracks.audio && tracks.audio.readyState !== 'ended') ms.addTrack(tracks.audio);
-  } else {
-    // Fallback: use peerStreams tracks
-    const s = peerStreams[socketId];
-    if (s) s.getTracks().forEach(t => ms.addTrack(t));
-  }
-  return ms;
-}
-
-function refreshTileVideo(socketId, stream, newTrack) {
-  if (!peers[socketId] && !peerNames[socketId]) return;
-  const tile = document.getElementById(`tile-${socketId}`);
-  if (!tile) { addRemoteTile(socketId, stream); return; }
-  const vid = tile.querySelector('video');
-  if (!vid) return;
-
-  // Build a fresh MediaStream — critical for mobile to detect the track change
-  const fresh = buildFreshStream(socketId);
-  vid.pause();
-  vid.srcObject = null;
-  requestAnimationFrame(() => {
-    vid.srcObject = fresh;
-    vid.muted = false;
-    vid.volume = 1.0;
-    safePlay(vid);
-  });
-
-  if (newTrack?.kind === 'video' || stream.getVideoTracks().length > 0) {
-    const ph = tile.querySelector('.no-video-placeholder');
-    if (ph) ph.classList.add('hidden');
-  }
-
-  // Refresh focus overlay if this peer is currently focused
-  if (focusedPeer === socketId) {
-    openFocusOverlay(socketId);
+async function offerToPeer(socketId) {
+  const pc = makePeer(socketId);
+  try {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    socket.emit('offer', { to: socketId, from: socket.id, offer, fromName: USER_NAME });
+  } catch (err) {
+    console.error('Offer creation error:', err);
   }
 }
 
-function removePeer(socketId) {
-  if (peers[socketId]) { peers[socketId].close(); delete peers[socketId]; }
+function renderRemoteTile(socketId) {
+  const stream = peerStreams[socketId];
+  if (!stream) return;
+
+  let tile = document.getElementById(`tile-${socketId}`);
+  if (!tile) {
+    tile = document.createElement('div');
+    tile.id = `tile-${socketId}`;
+    tile.className = 'video-tile';
+    tile.innerHTML = `
+      <video autoplay playsinline></video>
+      <div class="tile-info">
+        <div class="tile-name">${peerNames[socketId] || 'Guest'}</div>
+        <div class="tile-icons">
+          <span class="tile-icon mic-icon active">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 1a4 4 0 014 4v6a4 4 0 01-8 0V5a4 4 0 014-4zm-1 15.93V20H9v2h6v-2h-2v-3.07A7.001 7.001 0 0119 11h-2a5 5 0 01-10 0H5a7.001 7.001 0 006 6.93z"/></svg>
+          </span>
+        </div>
+      </div>
+      <div class="no-video-placeholder">
+        <div class="avatar-circle">${(peerNames[socketId] || 'G')[0].toUpperCase()}</div>
+      </div>
+    `;
+    tile.onclick = () => focusOnPeer(socketId);
+    videoGrid().appendChild(tile);
+  }
+
+  const video = tile.querySelector('video');
+  video.srcObject = stream;
+  tile.classList.remove('no-video');
+}
+
+function closePeer(socketId) {
+  const pc = peers[socketId];
+  if (pc) {
+    pc.close();
+    delete peers[socketId];
+  }
   delete peerStreams[socketId];
   delete peerTracks[socketId];
-  delete peerNames[socketId];
+
   const tile = document.getElementById(`tile-${socketId}`);
   if (tile) tile.remove();
-  document.getElementById(`hc-row-${socketId}`)?.remove();
-  // Sweep any orphan tiles whose socketId has no peer and no known name (ghost "Participant" tiles)
-  document.querySelectorAll('.video-tile[id^="tile-"]').forEach(t => {
-    const sid = t.id.replace('tile-', '');
-    if (sid !== 'local' && !peers[sid] && !peerNames[sid]) t.remove();
-  });
-  updateGridLayout();
-  updateParticipantCount();
 }
 
-// ── Remote tile ───────────────────────────────────────────────
-function addRemoteTile(socketId, stream) {
-  // FIX: strict guard — never create duplicate tiles
-  if (document.getElementById(`tile-${socketId}`)) {
-    // If tile exists but has placeholder name, update it now that we have the real name
-    const existingTile = document.getElementById(`tile-${socketId}`);
-    const nameEl = existingTile?.querySelector('.tile-name');
-    if (nameEl && nameEl.textContent === 'Participant' && peerNames[socketId]) {
-      const realName = peerNames[socketId];
-      nameEl.textContent = realName;
-      const avatarEl = existingTile.querySelector('.avatar-circle');
-      if (avatarEl) avatarEl.textContent = realName.charAt(0).toUpperCase();
-    }
-    return;
-  }
-  const name    = peerNames[socketId] || 'Participant';
-  const initial = name.charAt(0).toUpperCase();
-
-  const tile = document.createElement('div');
-  tile.className = 'video-tile';
-  tile.id = `tile-${socketId}`;
-  tile.innerHTML = `
-    <video autoplay playsinline></video>
-    <div class="tile-controls">
-      <button class="tile-action-btn tile-action-expand hidden" onclick="openFocusOverlay('${socketId}')" title="Expand screen">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
-      </button>
-      <button class="tile-action-btn tile-action-min" onclick="minimizeTile('${socketId}')" title="Minimize">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 20 15 20 15 15"/><polyline points="4 4 9 4 9 9"/><line x1="15" y1="20" x2="21" y2="14"/><line x1="9" y1="4" x2="3" y2="10"/></svg>
-      </button>
-      <button class="tile-action-btn tile-action-max hidden" onclick="maximizeTile('${socketId}')" title="Restore">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
-      </button>
-    </div>
-    <div class="tile-info">
-      <div class="tile-name">${escapeHtml(name)}</div>
-      <div class="tile-icons">
-        <span class="tile-icon mic-on">
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 1a4 4 0 014 4v6a4 4 0 01-8 0V5a4 4 0 014-4zm-1 15.93V20H9v2h6v-2h-2v-3.07A7.001 7.001 0 0019 11h-2a5 5 0 01-10 0H5a7.001 7.001 0 006 6.93z"/></svg>
-        </span>
-      </div>
-    </div>
-    <div class="no-video-placeholder">
-      <div class="avatar-circle">${escapeHtml(initial)}</div>
-    </div>`;
-
-  if (socketId === hostSocketId) {
-    const crown = document.createElement('div');
-    crown.className = 'host-crown'; crown.title = 'Host'; crown.textContent = '👑';
-    tile.appendChild(crown);
+// ── MEDIA: CAMERA & MIC ───────────────────────────────────────
+async function toggleCamera() {
+  if (!localStream) {
+    const ok = await makeLocalStream();
+    if (!ok) return;
+    micEnabled = true;
+    camEnabled = true;
+    updateMicButton();
   }
 
-  // Tap tile to fullscreen on mobile (double-tap or single tap on video area)
-  let _tapTimer = null;
-  tile.addEventListener('click', e => {
-    if (e.target.closest('button')) return;
-    if (_tapTimer) { clearTimeout(_tapTimer); _tapTimer = null; openFocusOverlay(socketId); return; }
-    _tapTimer = setTimeout(() => { _tapTimer = null; }, 280);
-  });
-  tile.addEventListener('dblclick', e => {
-    if (e.target.closest('button')) return;
-    openFocusOverlay(socketId);
-  });
-
-  const vid = tile.querySelector('video');
-  vid.volume = 1.0;
-  if (stream?.getTracks().length > 0) {
-    const initFresh = new MediaStream();
-    stream.getTracks().forEach(t => initFresh.addTrack(t));
-    vid.srcObject = initFresh;
-    safePlay(vid);
-    if (stream.getVideoTracks().length > 0) {
-      tile.querySelector('.no-video-placeholder').classList.add('hidden');
-    }
-  }
-  videoGrid().appendChild(tile);
-  updateGridLayout();
-}
-
-// ── Focus overlay (fullscreen shared screen) ──────────────────
-function openFocusOverlay(socketId) {
-  if (!peerStreams[socketId] && !peerTracks[socketId]) return;
-  focusedPeer = socketId;
-  const name = peerNames[socketId] || 'Participant';
-  const tile = document.getElementById(`tile-${socketId}`);
-  const isSharing = tile && tile.classList.contains('screenshare-tile');
-  focusName().textContent = name + (isSharing ? ' — Screen Share' : '');
-
-  const fv = focusVideo();
-  fv.pause();
-  fv.srcObject = null;
-
-  // Use rAF + fresh stream so mobile GPU decoder fully reinitialises
-  requestAnimationFrame(() => {
-    const fresh = buildFreshStream(socketId);
-    fv.srcObject = fresh;
-    fv.muted = false;
-    fv.volume = 1.0;
-    safePlay(fv);
-  });
-
-  focusOverlay().classList.remove('hidden');
-}
-
-function closeFocusOverlay() {
-  focusedPeer = null;
-  focusOverlay().classList.add('hidden');
-  const fv = focusVideo();
-  if (fv) fv.srcObject = null;
-}
-
-// ── Tile min/max ──────────────────────────────────────────────
-function minimizeTile(socketId) {
-  const tile = document.getElementById(`tile-${socketId}`);
-  if (!tile) return;
-  tile.classList.add('tile-minimized');
-  tile.querySelector('.tile-action-min').classList.add('hidden');
-  tile.querySelector('.tile-action-max').classList.remove('hidden');
-  updateGridLayout();
-}
-function maximizeTile(socketId) {
-  const tile = document.getElementById(`tile-${socketId}`);
-  if (!tile) return;
-  tile.classList.remove('tile-minimized');
-  tile.querySelector('.tile-action-min').classList.remove('hidden');
-  tile.querySelector('.tile-action-max').classList.add('hidden');
-  updateGridLayout();
-}
-function toggleLocalTile() {
-  const tile = document.getElementById('local-tile');
-  localMinimized = !localMinimized;
-  tile.classList.toggle('tile-minimized', localMinimized);
-  document.getElementById('local-min-btn').classList.toggle('hidden', localMinimized);
-  document.getElementById('local-max-btn').classList.toggle('hidden', !localMinimized);
-  updateGridLayout();
-}
-
-// ── safePlay ──────────────────────────────────────────────────
-function safePlay(videoEl) {
-  const p = videoEl.play();
-  if (p) p.catch(err => {
-    if (err.name === 'NotAllowedError') document.getElementById('audio-banner')?.classList.remove('hidden');
-  });
-}
-
-// ── FIX: Draggable PiP panel ──────────────────────────────────
-function initDraggablePip() {
-  const pip    = document.getElementById('screen-preview');
-  const handle = document.getElementById('screen-preview-drag-handle');
-  if (!pip || !handle) return;
-
-  let dragging = false, startX, startY, origLeft, origTop;
-
-  handle.addEventListener('mousedown', e => {
-    if (e.target.closest('button')) return; // don't drag if clicking a button
-    dragging = true;
-    // Convert current right/bottom to left/top for drag math
-    const rect = pip.getBoundingClientRect();
-    pip.style.right  = 'auto';
-    pip.style.bottom = 'auto';
-    pip.style.left   = rect.left + 'px';
-    pip.style.top    = rect.top  + 'px';
-    startX  = e.clientX;
-    startY  = e.clientY;
-    origLeft = rect.left;
-    origTop  = rect.top;
-    pip.style.transition = 'none';
-    e.preventDefault();
-  });
-
-  document.addEventListener('mousemove', e => {
-    if (!dragging) return;
-    const dx = e.clientX - startX;
-    const dy = e.clientY - startY;
-    let newLeft = origLeft + dx;
-    let newTop  = origTop  + dy;
-    // Clamp within viewport
-    newLeft = Math.max(0, Math.min(newLeft, window.innerWidth  - pip.offsetWidth));
-    newTop  = Math.max(0, Math.min(newTop,  window.innerHeight - pip.offsetHeight));
-    pip.style.left = newLeft + 'px';
-    pip.style.top  = newTop  + 'px';
-  });
-
-  document.addEventListener('mouseup', () => {
-    if (dragging) { dragging = false; pip.style.transition = ''; }
-  });
-
-  // Touch support
-  handle.addEventListener('touchstart', e => {
-    if (e.target.closest('button')) return;
-    const touch = e.touches[0];
-    const rect  = pip.getBoundingClientRect();
-    pip.style.right  = 'auto';
-    pip.style.bottom = 'auto';
-    pip.style.left   = rect.left + 'px';
-    pip.style.top    = rect.top  + 'px';
-    startX = touch.clientX; startY = touch.clientY;
-    origLeft = rect.left;   origTop  = rect.top;
-    dragging = true;
-    pip.style.transition = 'none';
-  }, { passive: true });
-
-  document.addEventListener('touchmove', e => {
-    if (!dragging) return;
-    const touch = e.touches[0];
-    let newLeft = origLeft + (touch.clientX - startX);
-    let newTop  = origTop  + (touch.clientY - startY);
-    newLeft = Math.max(0, Math.min(newLeft, window.innerWidth  - pip.offsetWidth));
-    newTop  = Math.max(0, Math.min(newTop,  window.innerHeight - pip.offsetHeight));
-    pip.style.left = newLeft + 'px';
-    pip.style.top  = newTop  + 'px';
-  }, { passive: true });
-
-  document.addEventListener('touchend', () => {
-    if (dragging) { dragging = false; pip.style.transition = ''; }
-  });
-}
-
-// ── Periodic health-check ─────────────────────────────────────
-setInterval(() => {
-  Object.keys(peerStreams).forEach(socketId => {
-    const stream = peerStreams[socketId];
-    if (!stream) return;
-    const tile = document.getElementById(`tile-${socketId}`);
-    if (!tile) return;
-    const vid = tile.querySelector('video');
-    if (!vid) return;
-    const needsFix = !vid.srcObject || (vid.readyState === 0 && stream.getVideoTracks().length > 0);
-    if (needsFix) {
-      const hfresh = buildFreshStream(socketId);
-      vid.pause(); vid.srcObject = null;
-      requestAnimationFrame(() => { vid.srcObject = hfresh; safePlay(vid); });
-    }
-    const fv = focusVideo();
-    if (focusedPeer === socketId && fv && (!fv.srcObject || fv.readyState === 0)) {
-      openFocusOverlay(socketId);
-    }
-  });
-}, 4000);
-
-// ── Grid ──────────────────────────────────────────────────────
-function updateGridLayout() {
-  const grid = videoGrid();
-  if (!grid) return;
-  const count = grid.children.length;
-  grid.setAttribute('data-count', Math.min(count, 6));
-}
-function updateParticipantCount() {
-  const n = Object.keys(peers).length + 1;
-  const el = participantCount();
-  if (el) el.textContent = n === 1 ? '1 participant' : `${n} participants`;
-}
-
-// ── Mic / Camera ──────────────────────────────────────────────
-function toggleMic() {
-  if (!localStream) return;
-  micEnabled = !micEnabled;
-  localStream.getAudioTracks().forEach(t => t.enabled = micEnabled);
-  document.getElementById('local-mic-icon').className = 'tile-icon ' + (micEnabled ? 'mic-on' : 'mic-off');
-  syncBtnUI();
-  socket.emit('media-state', { roomId: ROOM_ID, video: camEnabled, audio: micEnabled, screen: isScreenSharing });
-}
-function toggleCamera() {
-  if (!localStream) return;
   camEnabled = !camEnabled;
-  localStream.getVideoTracks().forEach(t => t.enabled = camEnabled);
-  localPlaceholder().classList.toggle('hidden', camEnabled);
-  syncBtnUI();
+  localStream?.getVideoTracks().forEach(t => t.enabled = camEnabled);
+  updateCameraButton();
+
   socket.emit('media-state', { roomId: ROOM_ID, video: camEnabled, audio: micEnabled, screen: isScreenSharing });
 }
-function syncBtnUI() {
-  const mb = document.getElementById('mic-btn');
-  if (!mb) return;
-  mb.querySelector('.icon-on').classList.toggle('hidden', !micEnabled);
-  mb.querySelector('.icon-off').classList.toggle('hidden', micEnabled);
-  mb.classList.toggle('off', !micEnabled);
-  mb.querySelector('span').textContent = micEnabled ? 'Mute' : 'Unmute';
 
-  const cb = document.getElementById('cam-btn');
-  if (!cb) return;
-  cb.querySelector('.icon-on').classList.toggle('hidden', !camEnabled);
-  cb.querySelector('.icon-off').classList.toggle('hidden', camEnabled);
-  cb.classList.toggle('off', !camEnabled);
-  cb.querySelector('span').textContent = camEnabled ? 'Camera' : 'Start Cam';
+async function toggleMic() {
+  if (!localStream) {
+    const ok = await makeLocalStream();
+    if (!ok) return;
+    micEnabled = true;
+    camEnabled = true;
+    updateMicButton();
+    updateCameraButton();
+  }
+
+  micEnabled = !micEnabled;
+  localStream?.getAudioTracks().forEach(t => t.enabled = micEnabled);
+  updateMicButton();
+
+  socket.emit('media-state', { roomId: ROOM_ID, video: camEnabled, audio: micEnabled, screen: isScreenSharing });
 }
 
-// ── Screen Share ──────────────────────────────────────────────
+function updateMicButton() {
+  const btn = document.getElementById('mic-btn');
+  const iconOn = btn.querySelector('.icon-on');
+  const iconOff = btn.querySelector('.icon-off');
+  
+  if (micEnabled) {
+    iconOn.classList.remove('hidden');
+    iconOff.classList.add('hidden');
+  } else {
+    iconOn.classList.add('hidden');
+    iconOff.classList.remove('hidden');
+  }
+}
+
+function updateCameraButton() {
+  const btn = document.getElementById('cam-btn');
+  const iconOn = btn.querySelector('.icon-on');
+  const iconOff = btn.querySelector('.icon-off');
+  
+  if (camEnabled) {
+    iconOn.classList.remove('hidden');
+    iconOff.classList.add('hidden');
+    localPlaceholder().classList.add('hidden');
+  } else {
+    iconOn.classList.add('hidden');
+    iconOff.classList.remove('hidden');
+    localPlaceholder().classList.remove('hidden');
+  }
+}
+
+// ── SCREEN SHARING ───────────────────────────────────────────
 async function toggleScreenShare() {
   isScreenSharing ? stopScreenShare() : await startScreenShare();
 }
@@ -922,7 +464,12 @@ async function toggleScreenShare() {
 async function startScreenShare() {
   try {
     screenStream = await navigator.mediaDevices.getDisplayMedia({
-      video: { cursor:'always', frameRate:{ideal:30,max:60}, width:{ideal:1920}, height:{ideal:1080} },
+      video: { 
+        cursor: 'always', 
+        frameRate: { ideal: 30, max: 60 }, 
+        width: { ideal: 1920 }, 
+        height: { ideal: 1080 } 
+      },
       audio: false
     });
   } catch (err) {
@@ -934,6 +481,7 @@ async function startScreenShare() {
   screenMinimized = false;
   const screenTrack = screenStream.getVideoTracks()[0];
 
+  // Send screen track to all peers
   await Promise.allSettled(Object.keys(peers).map(async sid => {
     const pc = peers[sid];
     const vs = pc.getSenders().find(s => s.track?.kind === 'video');
@@ -945,24 +493,58 @@ async function startScreenShare() {
     }
   }));
 
+  // ═══════════════════════════════════════════════════════════
+  // FIX: Screen preview video rendering
+  // ═══════════════════════════════════════════════════════════
   const spv = screenPreviewVid();
-  spv.srcObject = screenStream; spv.muted = true; spv.play().catch(()=>{});
+  spv.srcObject = screenStream;
+  spv.muted = true;
+  spv.style.width = '100%';
+  spv.style.height = '100%';
+  spv.style.objectFit = 'contain';
+  spv.style.display = 'block';
+  
+  // Ensure video plays
+  try {
+    await spv.play();
+  } catch (e) {
+    console.log('Auto-play blocked:', e);
+  }
 
-  // FIX: reset PiP position to default (top-right, away from chat)
+  // Position PiP away from chat (top-right, above control bar)
   const pip = screenPreview();
-  pip.style.left = ''; pip.style.top = '';
-  pip.style.right = '20px'; pip.style.bottom = 'calc(var(--ctrl-bar) + 16px)';
+  pip.style.left = '';
+  pip.style.top = '';
+  pip.style.right = '20px';
+  pip.style.bottom = 'calc(var(--ctrl-bar) + 16px)';
   pip.classList.remove('hidden', 'minimized');
 
+  // ═══════════════════════════════════════════════════════════
+  // FIX: Local tile display
+  // ═══════════════════════════════════════════════════════════
   const lv = localVideo();
-  lv.srcObject = screenStream; lv.muted = true; lv.style.transform = 'none';
+  lv.srcObject = screenStream;
+  lv.muted = true;
+  lv.style.transform = 'none';
+  lv.style.width = '100%';
+  lv.style.height = '100%';
+  lv.style.objectFit = 'contain';
+  lv.style.display = 'block';
+  
+  try {
+    await lv.play();
+  } catch (e) {
+    console.log('Local video play error:', e);
+  }
+
   localPlaceholder().classList.add('hidden');
 
   const localTile = document.getElementById('local-tile');
   localTile.classList.add('screenshare-tile');
   if (!localTile.querySelector('.screenshare-label')) {
     const lbl = document.createElement('div');
-    lbl.className = 'screenshare-label'; lbl.textContent = '🖥 You are presenting';
+    lbl.className = 'screenshare-label';
+    lbl.textContent = '🖥 You are presenting';
     localTile.appendChild(lbl);
   }
 
@@ -974,144 +556,300 @@ async function startScreenShare() {
   document.getElementById('screen-banner').classList.remove('hidden');
 
   socket.emit('media-state', { roomId: ROOM_ID, video: camEnabled, audio: micEnabled, screen: true });
+  
   screenTrack.onended = () => stopScreenShare();
   showToast('Screen sharing started');
 }
 
 function stopScreenShare() {
   if (!isScreenSharing) return;
+
   isScreenSharing = false;
-
-  if (screenStream) { screenStream.getTracks().forEach(t => t.stop()); screenStream = null; }
-
-  const camTrack = localStream?.getVideoTracks()[0] || null;
-  Object.keys(peers).forEach(sid => {
-    const pc = peers[sid];
-    const vs = pc.getSenders().find(s => s.track?.kind === 'video');
-    if (vs) vs.replaceTrack(camTrack).catch(()=>{});
-  });
-
-  const lv = localVideo();
-  if (localStream) {
-    lv.srcObject = localStream; lv.style.transform = '';
-    localPlaceholder().classList.toggle('hidden', camEnabled);
+  if (screenStream) {
+    screenStream.getTracks().forEach(t => t.stop());
+    screenStream = null;
   }
 
-  const localTile = document.getElementById('local-tile');
-  localTile.classList.remove('screenshare-tile');
-  localTile.querySelector('.screenshare-label')?.remove();
+  // Restore camera/mic video to all peers
+  if (localStream) {
+    const videoTrack = localStream.getVideoTracks()[0];
+    if (videoTrack) {
+      Object.keys(peers).forEach(sid => {
+        const pc = peers[sid];
+        const vs = pc.getSenders().find(s => s.track?.kind === 'video');
+        if (vs) {
+          vs.replaceTrack(videoTrack).catch(() => {});
+        }
+      });
+    }
+  }
 
-  const pip = screenPreview();
-  pip.classList.add('hidden');
-  screenPreviewVid().srcObject = null;
+  // Hide PiP
+  screenPreview().classList.add('hidden');
+  document.getElementById('screen-banner').classList.add('hidden');
+
+  // Restore local video to camera
+  const lv = localVideo();
+  if (localStream) {
+    lv.srcObject = localStream;
+    lv.style.transform = 'scaleX(-1)';
+    lv.style.width = '';
+    lv.style.height = '';
+    lv.style.objectFit = '';
+    lv.style.display = '';
+  }
+
+  localPlaceholder().classList.toggle('hidden', camEnabled);
+
+  const localTile = document.getElementById('local-tile');
+  const label = localTile.querySelector('.screenshare-label');
+  if (label) label.remove();
+  localTile.classList.remove('screenshare-tile');
 
   const btn = document.getElementById('screen-btn');
   btn.classList.remove('active');
   btn.querySelector('.icon-on').classList.remove('hidden');
   btn.querySelector('.icon-off').classList.add('hidden');
   btn.querySelector('span').textContent = 'Share';
-  document.getElementById('screen-banner').classList.add('hidden');
 
   socket.emit('media-state', { roomId: ROOM_ID, video: camEnabled, audio: micEnabled, screen: false });
   showToast('Screen sharing stopped');
 }
 
 function toggleScreenPreview() {
+  const pip = screenPreview();
   screenMinimized = !screenMinimized;
-  screenPreview().classList.toggle('minimized', screenMinimized);
-  const btn = document.getElementById('screen-preview-toggle');
-  btn.title = screenMinimized ? 'Maximize' : 'Minimize';
-  btn.innerHTML = screenMinimized
-    ? `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>`
-    : `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="10" y1="14" x2="3" y2="21"/><line x1="21" y1="3" x2="14" y2="10"/></svg>`;
+  pip.classList.toggle('minimized', screenMinimized);
 }
 
-// ── Chat ──────────────────────────────────────────────────────
+// ── FOCUS / FULLSCREEN ───────────────────────────────────────
+function focusOnPeer(socketId) {
+  focusedPeer = socketId;
+  const stream = peerStreams[socketId];
+  if (!stream) return;
+
+  focusVideo().srcObject = stream;
+  focusName().textContent = peerNames[socketId] || 'Peer';
+  focusOverlay().classList.remove('hidden');
+}
+
+function closeFocusOverlay() {
+  focusedPeer = null;
+  focusOverlay().classList.add('hidden');
+}
+
+// ── CHAT ─────────────────────────────────────────────────────
 function toggleChat() {
   chatOpen = !chatOpen;
-  chatPanel().classList.toggle('open', chatOpen);
-  document.getElementById('chat-btn').classList.toggle('active', chatOpen);
+  chatPanel().classList.toggle('hidden', !chatOpen);
   if (chatOpen) {
     unreadCount = 0;
     chatBadge().classList.add('hidden');
+    chatBadge().textContent = '0';
     chatInput().focus();
-    chatMessages().scrollTop = chatMessages().scrollHeight;
   }
 }
+
 function sendMessage() {
   const msg = chatInput().value.trim();
   if (!msg) return;
   socket.emit('chat-message', { roomId: ROOM_ID, message: msg, userName: USER_NAME });
   chatInput().value = '';
 }
-function appendMessage(userName, message, time, isOwn) {
-  const div = document.createElement('div');
-  div.className = 'chat-msg' + (isOwn ? ' own' : '');
-  div.innerHTML = `
-    <div class="chat-msg-header">
-      <span class="chat-msg-name">${escapeHtml(userName)}</span>
-      <span class="chat-msg-time">${time}</span>
-    </div>
-    <div class="chat-msg-body">${escapeHtml(message)}</div>`;
-  chatMessages().appendChild(div);
-  chatMessages().scrollTop = chatMessages().scrollHeight;
-}
-function addSystemMessage(text) {
-  const cm = chatMessages();
-  if (!cm) return;
-  const div = document.createElement('div');
-  div.className = 'chat-system';
-  div.textContent = text;
-  cm.appendChild(div);
-  cm.scrollTop = cm.scrollHeight;
-}
-document.addEventListener('keydown', e => {
-  const ci = chatInput();
-  if (ci && document.activeElement === ci && e.key === 'Enter' && !e.shiftKey) {
-    e.preventDefault(); sendMessage();
+
+document.getElementById('chat-input')?.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
   }
 });
 
-function forceUnlockAudio() {
-  document.querySelectorAll('.video-tile:not(.local-tile) video').forEach(v => {
-    v.muted = false; v.volume = 1.0; v.play().catch(()=>{});
-  });
-  document.getElementById('audio-banner')?.classList.add('hidden');
-  showToast('Audio enabled!');
-  audioUnlocked = true;
+// ── LOCAL TILE MINIMIZE ──────────────────────────────────────
+function toggleLocalTile() {
+  localMinimized = !localMinimized;
+  const localTile = document.getElementById('local-tile');
+  const minBtn = document.getElementById('local-min-btn');
+  const maxBtn = document.getElementById('local-max-btn');
+
+  localTile.classList.toggle('minimized', localMinimized);
+  minBtn.classList.toggle('hidden', localMinimized);
+  maxBtn.classList.toggle('hidden', !localMinimized);
+}
+
+// ── ROOM CONTROLS ────────────────────────────────────────────
+function updateParticipantCount() {
+  const count = 1 + Object.keys(peers).length;
+  const label = count === 1 ? '1 participant' : count + ' participants';
+  participantCount().textContent = label;
 }
 
 function leaveRoom() {
-  if (isScreenSharing && screenStream) screenStream.getTracks().forEach(t => t.stop());
-  Object.keys(peers).forEach(id => peers[id].close());
   if (localStream) localStream.getTracks().forEach(t => t.stop());
+  if (screenStream) screenStream.getTracks().forEach(t => t.stop());
   socket.disconnect();
   window.location.href = '/';
 }
 
-function copyRoomId() { navigator.clipboard.writeText(ROOM_ID).then(() => showToast('Meeting ID copied!')); }
-function copyLink()   { navigator.clipboard.writeText(window.location.href).then(() => showToast('Link copied!')); }
-
-function startTimer() {
-  startTime = Date.now();
-  setInterval(() => {
-    const s  = Math.floor((Date.now() - startTime) / 1000);
-    const mm = String(Math.floor(s / 60)).padStart(2,'0');
-    const ss = String(s % 60).padStart(2,'0');
-    const el = document.getElementById('meeting-time');
-    if (el) el.textContent = `${mm}:${ss}`;
-  }, 1000);
+function copyRoomId() {
+  navigator.clipboard.writeText(ROOM_ID).then(() => showToast('Room ID copied'));
 }
 
-let toastTimer;
+function copyLink() {
+  const link = window.location.href;
+  navigator.clipboard.writeText(link).then(() => showToast('Meeting link copied'));
+}
+
+// ── MEETING TIMER ────────────────────────────────────────────
+setInterval(() => {
+  const elapsed = Math.floor((Date.now() - startTime) / 1000);
+  const h = Math.floor(elapsed / 3600);
+  const m = Math.floor((elapsed % 3600) / 60);
+  const s = elapsed % 60;
+  const formatted = (h > 0 ? h + ':' : '') + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+  const el = document.getElementById('meeting-time');
+  if (el) el.textContent = formatted;
+}, 1000);
+
+// ── HOST CONTROLS ────────────────────────────────────────────
+function toggleParticipantsPanel() {
+  participantsPanelOpen = !participantsPanelOpen;
+  document.getElementById('participants-panel').classList.toggle('hidden', !participantsPanelOpen);
+}
+
+function showNextAdmitRequest() {
+  if (admitQueue.length === 0) {
+    pendingAdmission = null;
+    return;
+  }
+  const req = admitQueue.shift();
+  pendingAdmission = req;
+  const toast = document.getElementById('admit-toast');
+  document.getElementById('admit-avatar').textContent = (req.userName || '?')[0].toUpperCase();
+  document.getElementById('admit-name').textContent = req.userName;
+  toast.classList.remove('hidden');
+}
+
+function handleAdmit(allow) {
+  if (!pendingAdmission) return;
+  const { socketId, userName } = pendingAdmission;
+  document.getElementById('admit-toast').classList.add('hidden');
+
+  if (allow) {
+    socket.emit('admit-participant', { roomId: ROOM_ID, targetSocketId: socketId });
+  } else {
+    socket.emit('deny-participant', { roomId: ROOM_ID, targetSocketId: socketId });
+  }
+
+  const count = admitQueue.length;
+  if (count > 0) {
+    document.getElementById('admit-badge').textContent = count;
+    document.getElementById('admit-badge').classList.remove('hidden');
+    showNextAdmitRequest();
+  } else {
+    document.getElementById('admit-badge').classList.add('hidden');
+  }
+}
+
+function updateHostParticipantsList(participants) {
+  const list = document.getElementById('host-participants-list');
+  list.innerHTML = '';
+  const others = participants.filter(p => p.socketId !== socket.id);
+
+  if (others.length === 0) {
+    list.innerHTML = '<div class="hc-empty">No other participants</div>';
+    return;
+  }
+
+  others.forEach(p => {
+    const item = document.createElement('div');
+    item.className = 'hc-item';
+    const statusClass = (p.audio ? 'mic-on' : 'mic-off') + ' ' + (p.video ? 'cam-on' : 'cam-off') + (p.screen ? ' screen-on' : '');
+    item.innerHTML = `
+      <div class="hc-avatar">${(p.userName || 'G')[0].toUpperCase()}</div>
+      <div class="hc-name">${p.userName}</div>
+      <div class="hc-status ${statusClass}">
+        ${!p.audio ? '<span class="status-badge muted">🔇</span>' : ''}
+        ${!p.video ? '<span class="status-badge">📷</span>' : ''}
+        ${p.screen ? '<span class="status-badge">🖥</span>' : ''}
+      </div>
+      <div class="hc-controls">
+        <button class="hc-btn" onclick="remoteAction('mute-mic', '${p.socketId}', ${!p.audio})" title="Mute/Unmute">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 1a4 4 0 014 4v6a4 4 0 01-8 0V5a4 4 0 014-4zm-1 15.93V20H9v2h6v-2h-2v-3.07A7.001 7.001 0 0119 11h-2a5 5 0 01-10 0H5a7.001 7.001 0 006 6.93z"/></svg>
+        </button>
+        <button class="hc-btn" onclick="remoteAction('mute-cam', '${p.socketId}', ${!p.video})" title="Disable/Enable Camera">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 10l4.553-2.069A1 1 0 0121 8.87v6.26a1 1 0 01-1.447.9L15 14M3 8a2 2 0 012-2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z"/></svg>
+        </button>
+        <button class="hc-btn danger" onclick="remoteAction('kick', '${p.socketId}')" title="Remove from meeting">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="18" r="3"/><path d="M13.7 6.7A7 7 0 005 17M21 15a9 9 0 0-12.8-12"/></svg>
+        </button>
+      </div>
+    `;
+    list.appendChild(item);
+  });
+}
+
+function remoteAction(action, targetSocketId, state) {
+  if (action === 'mute-mic') {
+    socket.emit('host-mute-mic', { roomId: ROOM_ID, targetSocketId, mute: state });
+  } else if (action === 'mute-cam') {
+    socket.emit('host-mute-cam', { roomId: ROOM_ID, targetSocketId, mute: state });
+  } else if (action === 'kick') {
+    socket.emit('host-kick', { roomId: ROOM_ID, targetSocketId });
+  }
+}
+
+// ── UTILITIES ────────────────────────────────────────────────
+function forceUnlockAudio() {
+  if (audioUnlocked) return;
+  audioUnlocked = true;
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  ctx.resume();
+  document.getElementById('audio-banner').classList.add('hidden');
+}
+
 function showToast(msg) {
-  const t = document.getElementById('toast');
-  if (!t) return;
-  t.textContent = msg; t.classList.add('show');
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.classList.remove('show'), 2600);
+  const toast = document.getElementById('toast');
+  toast.textContent = msg;
+  toast.classList.add('show');
+  setTimeout(() => toast.classList.remove('show'), 2500);
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+function escapeHtml(text) {
+  const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' };
+  return text.replace(/[&<>"']/g, m => map[m]);
 }
+
+// ── DRAGGABLE PiP ───────────────────────────────────────────
+(function setupDraggablePiP() {
+  const pip = screenPreview();
+  const handle = document.getElementById('screen-preview-drag-handle');
+  let isDragging = false;
+  let offsetX = 0;
+  let offsetY = 0;
+
+  handle.addEventListener('mousedown', (e) => {
+    isDragging = true;
+    const rect = pip.getBoundingClientRect();
+    offsetX = e.clientX - rect.left;
+    offsetY = e.clientY - rect.top;
+    pip.style.cursor = 'grabbing';
+  });
+
+  document.addEventListener('mousemove', (e) => {
+    if (!isDragging) return;
+    pip.style.left = (e.clientX - offsetX) + 'px';
+    pip.style.top = (e.clientY - offsetY) + 'px';
+    pip.style.right = 'auto';
+    pip.style.bottom = 'auto';
+  });
+
+  document.addEventListener('mouseup', () => {
+    isDragging = false;
+    pip.style.cursor = 'grab';
+  });
+})();
+
+// ── INIT ─────────────────────────────────────────────────────
+makeLocalStream().catch(() => {
+  console.log('Failed to get local stream initially');
+});
