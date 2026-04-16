@@ -259,6 +259,39 @@ socket.on('chat-message', ({ userName, message, socketId: sid }) => {
   }
 });
 
+// ── CRITICAL FIX: replaceTrack() on the sender does NOT fire ontrack() on the receiver.
+// The receiver's <video> keeps decoding the old (black) stream unless we explicitly
+// force a srcObject rebind. These two events trigger that rebind.
+socket.on('peer-screen-share-started', ({ socketId }) => {
+  const stream = peerStreams[socketId];
+  if (!stream) return;
+  const tile = document.getElementById(`tile-${socketId}`);
+  const vid  = tile?.querySelector('video');
+  let attempts = 0;
+  const tryRebind = () => {
+    attempts++;
+    if (vid) { vid.srcObject = null; vid.srcObject = stream; safePlay(vid); }
+    const hasFrames = vid && vid.readyState >= 2;
+    const hasLive   = stream.getVideoTracks().some(t => t.readyState === 'live');
+    if (!hasFrames && hasLive && attempts < 15) {
+      setTimeout(tryRebind, 300);
+    }
+  };
+  setTimeout(tryRebind, 300);
+});
+
+socket.on('peer-screen-share-stopped', ({ socketId }) => {
+  const stream = peerStreams[socketId];
+  if (!stream) return;
+  const tile = document.getElementById(`tile-${socketId}`);
+  const vid  = tile?.querySelector('video');
+  if (vid) { vid.srcObject = null; vid.srcObject = stream; safePlay(vid); }
+  const fv = focusVideo();
+  if (focusedPeer === socketId && fv) {
+    fv.srcObject = null; fv.srcObject = stream; safePlay(fv);
+  }
+});
+
 socket.on('peer-media-state', ({ socketId, video, audio, screen }) => {
   const tile = document.getElementById(`tile-${socketId}`);
   if (!tile) return;
@@ -563,11 +596,21 @@ async function createPeer(socketId, initiator) {
     stream.addTrack(track);
     if (track.kind === 'audio') track.enabled = true;
 
+    // onunmute fires when the track transitions from muted→active (i.e. first real frames
+    // arrive after a replaceTrack). Rebinding srcObject here clears black frames.
     track.onmute   = () => console.log(`[peer ${socketId}] track muted   ${track.kind}`);
-    track.onunmute = () => refreshTileVideo(socketId, stream);
+    track.onunmute = () => {
+      console.log(`[peer ${socketId}] track unmuted ${track.kind} — rebinding video`);
+      refreshTileVideo(socketId, stream);
+    };
     track.onended  = () => { stream.removeTrack(track); refreshTileVideo(socketId, stream); };
 
+    // Initial bind — also schedule a deferred rebind to flush any black first-frame
     refreshTileVideo(socketId, stream, track);
+    if (track.kind === 'video') {
+      // Give the decoder 400ms to produce the first real frame then rebind once more
+      setTimeout(() => refreshTileVideo(socketId, stream, track), 400);
+    }
     updateGridLayout();
   };
 
@@ -983,6 +1026,10 @@ async function startScreenShare() {
   document.getElementById('screen-banner').classList.remove('hidden');
 
   socket.emit('media-state', { roomId: ROOM_ID, video: camEnabled, audio: micEnabled, screen: true });
+  // Notify peers explicitly so they re-bind their video element to the now-replaced track.
+  // replaceTrack() does NOT fire ontrack on the receiver, so without this signal the
+  // receiver's <video> keeps decoding the old (now-black) encoded stream.
+  socket.emit('screen-share-started', { roomId: ROOM_ID });
 
   // Handle user clicking browser's "Stop sharing" button
   screenTrack.onended = () => stopScreenShare();
@@ -1033,6 +1080,7 @@ function stopScreenShare() {
   document.getElementById('screen-banner').classList.add('hidden');
 
   socket.emit('media-state', { roomId: ROOM_ID, video: camEnabled, audio: micEnabled, screen: false });
+  socket.emit('screen-share-stopped', { roomId: ROOM_ID });
   showToast('Screen sharing stopped');
 }
 
