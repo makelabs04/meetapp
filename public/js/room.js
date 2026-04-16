@@ -270,7 +270,8 @@ socket.on('peer-media-state', ({ socketId, video, audio, screen }) => {
   if (ph) ph.classList.toggle('hidden', !!(video || screen));
 
   const expandBtn = tile.querySelector('.tile-action-expand');
-  if (expandBtn) expandBtn.classList.toggle('hidden', !screen);
+  // Always show expand button so users can tap to fullscreen any tile
+  if (expandBtn) expandBtn.classList.remove('hidden');
 
   let label = tile.querySelector('.screenshare-label');
   if (screen) {
@@ -574,13 +575,20 @@ function refreshTileVideo(socketId, stream, newTrack) {
     if (ph) ph.classList.add('hidden');
   }
 
-  // Also refresh focus overlay if this peer is focused
+  // Also refresh focus overlay if this peer is focused — force full re-attach
   const fv = focusVideo();
   if (focusedPeer === socketId && fv) {
+    fv.pause();
     fv.srcObject = null;
-    fv.srcObject = stream;
-    fv.muted = false; fv.volume = 1.0;
-    safePlay(fv);
+    setTimeout(() => {
+      const s2 = peerStreams[socketId];
+      if (!s2) return;
+      const ms2 = new MediaStream();
+      s2.getTracks().forEach(t => ms2.addTrack(t));
+      fv.srcObject = ms2;
+      fv.muted = false; fv.volume = 1.0;
+      safePlay(fv);
+    }, 60);
   }
 }
 
@@ -624,7 +632,7 @@ function addRemoteTile(socketId, stream) {
   tile.innerHTML = `
     <video autoplay playsinline></video>
     <div class="tile-controls">
-      <button class="tile-action-btn tile-action-expand hidden" onclick="openFocusOverlay('${socketId}')" title="Expand screen">
+      <button class="tile-action-btn tile-action-expand" onclick="openFocusOverlay('${socketId}')" title="Fullscreen">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
       </button>
       <button class="tile-action-btn tile-action-min" onclick="minimizeTile('${socketId}')" title="Minimize">
@@ -652,6 +660,16 @@ function addRemoteTile(socketId, stream) {
     tile.appendChild(crown);
   }
 
+  // Tap tile to fullscreen (works on mobile without needing to hit small button)
+  tile.addEventListener('dblclick', () => openFocusOverlay(socketId));
+  // Single tap on video area opens focus on mobile
+  let tapTimer = null;
+  tile.addEventListener('click', e => {
+    if (e.target.closest('button')) return; // don't trigger on button clicks
+    if (tapTimer) { clearTimeout(tapTimer); tapTimer = null; openFocusOverlay(socketId); return; }
+    tapTimer = setTimeout(() => { tapTimer = null; }, 300);
+  });
+
   const vid = tile.querySelector('video');
   vid.volume = 1.0;
   if (stream?.getTracks().length > 0) {
@@ -671,13 +689,33 @@ function openFocusOverlay(socketId) {
   if (!stream) return;
   focusedPeer = socketId;
   const name = peerNames[socketId] || 'Participant';
-  focusName().textContent = name + ' — Screen Share';
+  // Show "Screen Share" label only when actually screen sharing, otherwise just name
+  const tile = document.getElementById(`tile-${socketId}`);
+  const isSharing = tile && tile.classList.contains('screenshare-tile');
+  focusName().textContent = name + (isSharing ? ' — Screen Share' : '');
 
   const fv = focusVideo();
+  // Force detach first — critical for mobile to re-render video
+  fv.pause();
   fv.srcObject = null;
-  fv.srcObject = stream;
-  fv.muted = false; fv.volume = 1.0;
-  safePlay(fv);
+
+  // Small tick so browser releases old track before attaching new one
+  setTimeout(() => {
+    const freshStream = peerStreams[socketId];
+    if (!freshStream) return;
+    // On mobile, getVideoTracks()[0] may be the screen track — attach directly
+    const videoTrack = freshStream.getVideoTracks()[0];
+    if (videoTrack) {
+      const ms = new MediaStream();
+      freshStream.getTracks().forEach(t => ms.addTrack(t));
+      fv.srcObject = ms;
+    } else {
+      fv.srcObject = freshStream;
+    }
+    fv.muted = false;
+    fv.volume = 1.0;
+    safePlay(fv);
+  }, 80);
 
   focusOverlay().classList.remove('hidden');
 }
