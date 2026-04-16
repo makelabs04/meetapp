@@ -199,24 +199,14 @@ socket.on('user-joined', ({ socketId, userName, participants }) => {
 
 socket.on('offer', async ({ from, offer, fromName }) => {
   peerNames[from] = fromName;
-
-  // If a peer connection already exists, this is a RENEGOTIATION offer (e.g. screen share
-  // track swap). Do NOT tear down the existing connection — just apply the new SDP.
-  // Destroying and recreating the peer loses all tracks and causes a black screen.
+  // FIX: if peer already exists, close old one cleanly before recreating
   if (peers[from]) {
-    try {
-      const pc = peers[from];
-      await pc.setRemoteDescription(new RTCSessionDescription(offer));
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      socket.emit('answer', { to: from, from: socket.id, answer });
-    } catch (e) {
-      console.warn('[offer] renegotiation failed:', e.message);
-    }
-    return;
+    peers[from].close();
+    delete peers[from];
+    delete peerStreams[from];
+    const oldTile = document.getElementById(`tile-${from}`);
+    if (oldTile) oldTile.remove();
   }
-
-  // Fresh connection — create new peer
   await createPeer(from, false);
   const pc = peers[from];
   await pc.setRemoteDescription(new RTCSessionDescription(offer));
@@ -269,44 +259,6 @@ socket.on('chat-message', ({ userName, message, socketId: sid }) => {
   }
 });
 
-// ── CRITICAL FIX: replaceTrack() on the sender does NOT fire ontrack() on the receiver.
-// The receiver's <video> keeps decoding the old (black) stream unless we explicitly
-// force a srcObject rebind. These two events trigger that rebind.
-socket.on('peer-screen-share-started', ({ socketId }) => {
-  // peer-media-state arrives first (opens focus overlay with stale/black video),
-  // then this event arrives. We must rebind BOTH the tile video AND the focus overlay.
-  const rebindAll = () => {
-    const stream = peerStreams[socketId];
-    if (!stream) return;
-    const tile = document.getElementById(`tile-${socketId}`);
-    const vid  = tile?.querySelector('video');
-    if (vid) { vid.srcObject = null; vid.srcObject = stream; safePlay(vid); }
-    // Always refresh focus overlay — it may have been opened by peer-media-state already
-    const fv = focusVideo();
-    if (fv) { fv.srcObject = null; fv.srcObject = stream; fv.muted = false; fv.volume = 1.0; safePlay(fv); }
-    // If focus overlay isn't open yet, open it now with the live stream
-    if (!focusedPeer || focusedPeer !== socketId) {
-      openFocusOverlay(socketId);
-    }
-  };
-  // Run immediately and again after short delays to catch slow decoders
-  setTimeout(rebindAll, 100);
-  setTimeout(rebindAll, 500);
-  setTimeout(rebindAll, 1200);
-});
-
-socket.on('peer-screen-share-stopped', ({ socketId }) => {
-  const stream = peerStreams[socketId];
-  if (!stream) return;
-  const tile = document.getElementById(`tile-${socketId}`);
-  const vid  = tile?.querySelector('video');
-  if (vid) { vid.srcObject = null; vid.srcObject = stream; safePlay(vid); }
-  const fv = focusVideo();
-  if (focusedPeer === socketId && fv) {
-    fv.srcObject = null; fv.srcObject = stream; safePlay(fv);
-  }
-});
-
 socket.on('peer-media-state', ({ socketId, video, audio, screen }) => {
   const tile = document.getElementById(`tile-${socketId}`);
   if (!tile) return;
@@ -329,8 +281,21 @@ socket.on('peer-media-state', ({ socketId, video, audio, screen }) => {
       label.textContent = '🖥 Presenting';
       tile.appendChild(label);
     }
-    // Do NOT open the focus overlay here — video is not bound yet at this point.
-    // peer-screen-share-started fires next and handles the rebind + overlay open.
+    // Wait for the incoming video track to carry live frames before opening
+    // the focus overlay. Poll until the video element is actually playing.
+    const stream = peerStreams[socketId];
+    const vid = tile.querySelector('video');
+    let attempts = 0;
+    const tryOpen = () => {
+      attempts++;
+      const hasLiveVideo = stream && stream.getVideoTracks().some(t => t.readyState === 'live');
+      if ((vid && vid.readyState >= 2) || hasLiveVideo || attempts >= 10) {
+        openFocusOverlay(socketId);
+      } else {
+        setTimeout(tryOpen, 300);
+      }
+    };
+    setTimeout(tryOpen, 300);
   } else {
     tile.classList.remove('screenshare-tile');
     if (label) label.remove();
@@ -598,21 +563,11 @@ async function createPeer(socketId, initiator) {
     stream.addTrack(track);
     if (track.kind === 'audio') track.enabled = true;
 
-    // onunmute fires when the track transitions from muted→active (i.e. first real frames
-    // arrive after a replaceTrack). Rebinding srcObject here clears black frames.
     track.onmute   = () => console.log(`[peer ${socketId}] track muted   ${track.kind}`);
-    track.onunmute = () => {
-      console.log(`[peer ${socketId}] track unmuted ${track.kind} — rebinding video`);
-      refreshTileVideo(socketId, stream);
-    };
+    track.onunmute = () => refreshTileVideo(socketId, stream);
     track.onended  = () => { stream.removeTrack(track); refreshTileVideo(socketId, stream); };
 
-    // Initial bind — also schedule a deferred rebind to flush any black first-frame
     refreshTileVideo(socketId, stream, track);
-    if (track.kind === 'video') {
-      // Give the decoder 400ms to produce the first real frame then rebind once more
-      setTimeout(() => refreshTileVideo(socketId, stream, track), 400);
-    }
     updateGridLayout();
   };
 
@@ -749,28 +704,13 @@ function openFocusOverlay(socketId) {
   focusName().textContent = name + ' — Screen Share';
 
   const fv = focusVideo();
+  // Force null → reassign to flush any stale/black buffered frame
   fv.srcObject = null;
   fv.srcObject = stream;
   fv.muted = false; fv.volume = 1.0;
   safePlay(fv);
 
   focusOverlay().classList.remove('hidden');
-
-  // Deferred rebind: if the decoder hasn't produced frames yet, force another
-  // srcObject flush after a short delay. This fixes the "black fullscreen" case
-  // where the overlay opens before the first keyframe arrives.
-  const rebind = () => {
-    if (focusedPeer !== socketId) return; // user closed overlay already
-    const fv2 = focusVideo();
-    if (!fv2) return;
-    if (fv2.readyState < 2) {
-      fv2.srcObject = null;
-      fv2.srcObject = peerStreams[socketId] || stream;
-      safePlay(fv2);
-    }
-  };
-  setTimeout(rebind, 400);
-  setTimeout(rebind, 1000);
 }
 
 function closeFocusOverlay() {
@@ -996,10 +936,7 @@ async function startScreenShare() {
     setTimeout(resolve, 500);
   });
 
-  // Replace video track on every existing peer connection AND renegotiate.
-  // replaceTrack() alone does NOT renegotiate — the receiver keeps the old SDP
-  // codec parameters (resolution, framerate) which mismatches the screen track
-  // and causes a permanently black tile on the receiver side.
+  // Replace video track on every existing peer connection
   await Promise.allSettled(Object.keys(peers).map(async sid => {
     const pc = peers[sid];
     if (pc.connectionState === 'failed' || pc.connectionState === 'closed') return;
@@ -1012,14 +949,6 @@ async function startScreenShare() {
       }
     } else {
       pc.addTrack(screenTrack, screenStream);
-    }
-    // Force renegotiation so receiver updates its decoder for the new track dimensions.
-    try {
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      socket.emit('offer', { to: sid, offer, from: socket.id, fromName: USER_NAME });
-    } catch (e) {
-      console.warn(`[screen] renegotiation failed for ${sid}:`, e.message);
     }
   }));
 
@@ -1054,10 +983,6 @@ async function startScreenShare() {
   document.getElementById('screen-banner').classList.remove('hidden');
 
   socket.emit('media-state', { roomId: ROOM_ID, video: camEnabled, audio: micEnabled, screen: true });
-  // Notify peers explicitly so they re-bind their video element to the now-replaced track.
-  // replaceTrack() does NOT fire ontrack on the receiver, so without this signal the
-  // receiver's <video> keeps decoding the old (now-black) encoded stream.
-  socket.emit('screen-share-started', { roomId: ROOM_ID });
 
   // Handle user clicking browser's "Stop sharing" button
   screenTrack.onended = () => stopScreenShare();
@@ -1070,25 +995,19 @@ function stopScreenShare() {
 
   if (screenStream) { screenStream.getTracks().forEach(t => t.stop()); screenStream = null; }
 
-  // Restore camera track on all peers and renegotiate
+  // Restore camera track on all peers (null replaceTrack sends black — use a live track or remove)
   const camTrack = localStream?.getVideoTracks().find(t => t.readyState === 'live') || null;
-  Object.keys(peers).forEach(async sid => {
+  Object.keys(peers).forEach(sid => {
     const pc = peers[sid];
     if (pc.connectionState === 'failed' || pc.connectionState === 'closed') return;
     const vs = pc.getSenders().find(s => s.track?.kind === 'video');
     if (!vs) return;
-    try {
-      if (camTrack) {
-        await vs.replaceTrack(camTrack);
-      } else {
-        vs.replaceTrack(null).catch(() => {});
-      }
-      // Renegotiate so receiver decoder updates for camera track dimensions
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      socket.emit('offer', { to: sid, offer, from: socket.id, fromName: USER_NAME });
-    } catch (e) {
-      console.warn(`[screen stop] replaceTrack/renegotiate ${sid}:`, e.message);
+    if (camTrack) {
+      vs.replaceTrack(camTrack).catch(e => console.warn(`[screen stop] replaceTrack ${sid}:`, e.message));
+    } else {
+      // Camera was never available — replace with null to send silence/black
+      // but don't crash; some browsers reject null replaceTrack
+      vs.replaceTrack(null).catch(() => {});
     }
   });
 
@@ -1114,7 +1033,6 @@ function stopScreenShare() {
   document.getElementById('screen-banner').classList.add('hidden');
 
   socket.emit('media-state', { roomId: ROOM_ID, video: camEnabled, audio: micEnabled, screen: false });
-  socket.emit('screen-share-stopped', { roomId: ROOM_ID });
   showToast('Screen sharing stopped');
 }
 
