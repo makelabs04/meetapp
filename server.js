@@ -110,6 +110,14 @@ io.on('connection', (socket) => {
   socket.on('answer',        ({ to, answer,     from })           => io.to(to).emit('answer',        { from, answer }));
   socket.on('ice-candidate', ({ to, candidate,  from })           => io.to(to).emit('ice-candidate', { from, candidate }));
 
+  // Relay screen share notifications so receivers know to re-bind their video element
+  socket.on('screen-share-started', ({ roomId }) => {
+    socket.to(roomId).emit('peer-screen-share-started', { socketId: socket.id });
+  });
+  socket.on('screen-share-stopped', ({ roomId }) => {
+    socket.to(roomId).emit('peer-screen-share-stopped', { socketId: socket.id });
+  });
+
   // ── CHAT ────────────────────────────────────────────────────
   socket.on('chat-message', ({ roomId, message, userName }) => {
     io.in(roomId).emit('chat-message', {
