@@ -310,7 +310,49 @@ socket.on('peer-media-state', ({ socketId, video, audio, screen }) => {
   }
 });
 
-// ── HOST: admission requests ──────────────────────────────────
+// ── Screen share refresh signals (receiver side) ──────────────
+// The sender calls screen-share-started → server relays → we receive peer-screen-share-started.
+// Because replaceTrack() on the sender does NOT trigger a new ontrack() on the receiver
+// in most browsers (same codec, same m-line), we must manually re-bind the video element
+// to flush the stale black frame from the old cam track.
+socket.on('peer-screen-share-started', ({ socketId }) => {
+  // Give the RTP pipeline a short moment to deliver the first screen frame
+  setTimeout(() => {
+    const stream = peerStreams[socketId];
+    if (!stream) return;
+    const tile = document.getElementById(`tile-${socketId}`);
+    const vid  = tile?.querySelector('video');
+    if (vid) {
+      vid.srcObject = null;
+      vid.srcObject = stream;
+      safePlay(vid);
+    }
+    // Also refresh focus overlay if this peer is currently focused
+    const fv = focusVideo();
+    if (focusedPeer === socketId && fv) {
+      fv.srcObject = null;
+      fv.srcObject = stream;
+      safePlay(fv);
+    }
+  }, 300);
+});
+
+socket.on('peer-screen-share-stopped', ({ socketId }) => {
+  setTimeout(() => {
+    const stream = peerStreams[socketId];
+    if (!stream) return;
+    const tile = document.getElementById(`tile-${socketId}`);
+    const vid  = tile?.querySelector('video');
+    if (vid) {
+      vid.srcObject = null;
+      vid.srcObject = stream;
+      safePlay(vid);
+    }
+    if (focusedPeer === socketId) closeFocusOverlay();
+  }, 200);
+});
+
+
 socket.on('admission-request', ({ socketId, userName }) => {
   admitQueue.push({ socketId, userName });
   updateAdmitBadge();
@@ -556,18 +598,35 @@ async function createPeer(socketId, initiator) {
 
   pc.ontrack = ({ track, streams }) => {
     console.log(`[peer ${socketId}] ontrack ${track.kind} id=${track.id} readyState=${track.readyState}`);
+
+    // FIX: Always use the incoming stream directly (streams[0]) when available.
+    // replaceTrack() sends on the same stream, so streams[0] carries the latest track.
+    // Falling back to our cached MediaStream caused receivers to keep showing the old cam.
+    const incomingStream = (streams && streams[0]) ? streams[0] : null;
+
+    if (incomingStream) {
+      // Update our cache to point to the real incoming stream
+      peerStreams[socketId] = incomingStream;
+    }
+
     const stream = peerStreams[socketId];
 
-    // Replace any existing track of the same kind to avoid duplicates
-    stream.getTracks().filter(t => t.kind === track.kind).forEach(t => stream.removeTrack(t));
-    stream.addTrack(track);
+    // For manual MediaStream (no streams[0]), splice the track in
+    if (!incomingStream) {
+      stream.getTracks().filter(t => t.kind === track.kind).forEach(t => stream.removeTrack(t));
+      stream.addTrack(track);
+    }
+
     if (track.kind === 'audio') track.enabled = true;
 
     track.onmute   = () => console.log(`[peer ${socketId}] track muted   ${track.kind}`);
-    track.onunmute = () => refreshTileVideo(socketId, stream);
-    track.onended  = () => { stream.removeTrack(track); refreshTileVideo(socketId, stream); };
+    track.onunmute = () => refreshTileVideo(socketId, peerStreams[socketId]);
+    track.onended  = () => {
+      if (!incomingStream) peerStreams[socketId]?.removeTrack(track);
+      refreshTileVideo(socketId, peerStreams[socketId]);
+    };
 
-    refreshTileVideo(socketId, stream, track);
+    refreshTileVideo(socketId, peerStreams[socketId], track);
     updateGridLayout();
   };
 
@@ -844,17 +903,21 @@ setInterval(() => {
       vid.paused;
 
     if (needsRefresh) {
+      // FIX: preserve whatever srcObject is currently bound (may be a live screen-share
+      // stream from replaceTrack). Only fall back to peerStreams cache if nothing is bound.
+      const src = vid.srcObject || stream;
       console.log(`[health] refreshing stalled video for ${socketId} readyState=${vid.readyState} paused=${vid.paused}`);
       vid.srcObject = null;
-      vid.srcObject = stream;
+      vid.srcObject = src;
       safePlay(vid);
     }
 
     // Also keep the focus overlay in sync
     const fv = focusVideo();
     if (focusedPeer === socketId && fv) {
+      const fvSrc = fv.srcObject || stream;
       if (!fv.srcObject || fv.readyState < 2 || fv.paused) {
-        fv.srcObject = null; fv.srcObject = stream; safePlay(fv);
+        fv.srcObject = null; fv.srcObject = fvSrc; safePlay(fv);
       }
     }
   });
@@ -926,14 +989,33 @@ async function startScreenShare() {
   screenMinimized = false;
   const screenTrack = screenStream.getVideoTracks()[0];
 
-  // Wait for the screen track to become live before sending to peers.
-  // This is the primary cause of black screens: the track isn't producing
-  // frames yet when replaceTrack() is called, so receivers get a black frame.
+  // Improve encoding quality for screen content
+  screenTrack.contentHint = 'detail';
+
+  // Wait for the screen track to actually produce its FIRST FRAME before sending.
+  // The unmute event fires too early on many browsers — the track is 'live' but
+  // the encoder hasn't output any frames yet, which causes receivers to decode black.
+  // We use a hidden <video> to detect when real pixel data is available.
   await new Promise(resolve => {
-    if (screenTrack.readyState === 'live') { resolve(); return; }
-    screenTrack.addEventListener('unmute', resolve, { once: true });
-    // Safety fallback — resolve after 500 ms even if event never fires
-    setTimeout(resolve, 500);
+    if (screenTrack.readyState !== 'live') { resolve(); return; }
+    const probe = document.createElement('video');
+    probe.muted = true;
+    probe.srcObject = new MediaStream([screenTrack]);
+    probe.play().catch(() => {});
+    let attempts = 0;
+    const check = () => {
+      attempts++;
+      // videoWidth > 0 means the decoder has at least one decoded frame
+      if (probe.videoWidth > 0 || attempts >= 20) {
+        probe.srcObject = null;
+        resolve();
+      } else {
+        requestAnimationFrame(check);
+      }
+    };
+    requestAnimationFrame(check);
+    // Hard fallback: 800 ms max wait so we never hang
+    setTimeout(() => { probe.srcObject = null; resolve(); }, 800);
   });
 
   // Replace video track on every existing peer connection
@@ -983,6 +1065,11 @@ async function startScreenShare() {
   document.getElementById('screen-banner').classList.remove('hidden');
 
   socket.emit('media-state', { roomId: ROOM_ID, video: camEnabled, audio: micEnabled, screen: true });
+
+  // Emit a dedicated signal so receivers immediately re-bind their video element.
+  // replaceTrack() on the sender does NOT fire a new ontrack on the receiver when
+  // the codec/m-line is unchanged — so receivers stay stuck on their old srcObject.
+  socket.emit('screen-share-started', { roomId: ROOM_ID });
 
   // Handle user clicking browser's "Stop sharing" button
   screenTrack.onended = () => stopScreenShare();
