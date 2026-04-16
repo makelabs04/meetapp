@@ -199,14 +199,24 @@ socket.on('user-joined', ({ socketId, userName, participants }) => {
 
 socket.on('offer', async ({ from, offer, fromName }) => {
   peerNames[from] = fromName;
-  // FIX: if peer already exists, close old one cleanly before recreating
+
+  // If a peer connection already exists, this is a RENEGOTIATION offer (e.g. screen share
+  // track swap). Do NOT tear down the existing connection — just apply the new SDP.
+  // Destroying and recreating the peer loses all tracks and causes a black screen.
   if (peers[from]) {
-    peers[from].close();
-    delete peers[from];
-    delete peerStreams[from];
-    const oldTile = document.getElementById(`tile-${from}`);
-    if (oldTile) oldTile.remove();
+    try {
+      const pc = peers[from];
+      await pc.setRemoteDescription(new RTCSessionDescription(offer));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      socket.emit('answer', { to: from, from: socket.id, answer });
+    } catch (e) {
+      console.warn('[offer] renegotiation failed:', e.message);
+    }
+    return;
   }
+
+  // Fresh connection — create new peer
   await createPeer(from, false);
   const pc = peers[from];
   await pc.setRemoteDescription(new RTCSessionDescription(offer));
@@ -986,7 +996,10 @@ async function startScreenShare() {
     setTimeout(resolve, 500);
   });
 
-  // Replace video track on every existing peer connection
+  // Replace video track on every existing peer connection AND renegotiate.
+  // replaceTrack() alone does NOT renegotiate — the receiver keeps the old SDP
+  // codec parameters (resolution, framerate) which mismatches the screen track
+  // and causes a permanently black tile on the receiver side.
   await Promise.allSettled(Object.keys(peers).map(async sid => {
     const pc = peers[sid];
     if (pc.connectionState === 'failed' || pc.connectionState === 'closed') return;
@@ -999,6 +1012,14 @@ async function startScreenShare() {
       }
     } else {
       pc.addTrack(screenTrack, screenStream);
+    }
+    // Force renegotiation so receiver updates its decoder for the new track dimensions.
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      socket.emit('offer', { to: sid, offer, from: socket.id, fromName: USER_NAME });
+    } catch (e) {
+      console.warn(`[screen] renegotiation failed for ${sid}:`, e.message);
     }
   }));
 
@@ -1049,19 +1070,25 @@ function stopScreenShare() {
 
   if (screenStream) { screenStream.getTracks().forEach(t => t.stop()); screenStream = null; }
 
-  // Restore camera track on all peers (null replaceTrack sends black — use a live track or remove)
+  // Restore camera track on all peers and renegotiate
   const camTrack = localStream?.getVideoTracks().find(t => t.readyState === 'live') || null;
-  Object.keys(peers).forEach(sid => {
+  Object.keys(peers).forEach(async sid => {
     const pc = peers[sid];
     if (pc.connectionState === 'failed' || pc.connectionState === 'closed') return;
     const vs = pc.getSenders().find(s => s.track?.kind === 'video');
     if (!vs) return;
-    if (camTrack) {
-      vs.replaceTrack(camTrack).catch(e => console.warn(`[screen stop] replaceTrack ${sid}:`, e.message));
-    } else {
-      // Camera was never available — replace with null to send silence/black
-      // but don't crash; some browsers reject null replaceTrack
-      vs.replaceTrack(null).catch(() => {});
+    try {
+      if (camTrack) {
+        await vs.replaceTrack(camTrack);
+      } else {
+        vs.replaceTrack(null).catch(() => {});
+      }
+      // Renegotiate so receiver decoder updates for camera track dimensions
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      socket.emit('offer', { to: sid, offer, from: socket.id, fromName: USER_NAME });
+    } catch (e) {
+      console.warn(`[screen stop] replaceTrack/renegotiate ${sid}:`, e.message);
     }
   });
 
