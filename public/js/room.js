@@ -565,30 +565,42 @@ function refreshTileVideo(socketId, stream, newTrack) {
   const vid = tile.querySelector('video');
   if (!vid) return;
 
+  // CRITICAL FIX: always build a fresh MediaStream — reusing the same mutated
+  // stream object causes mobile browsers (Chrome/WebView) to show black video
+  // because the decoder does not detect the track change on the same reference.
+  const freshStream = new MediaStream();
+  stream.getTracks().forEach(t => freshStream.addTrack(t));
+
+  vid.pause();
   vid.srcObject = null;
-  vid.srcObject = stream;
-  vid.muted = false; vid.volume = 1.0;
-  safePlay(vid);
+  // One rAF tick so the browser fully releases the old decoder before attaching new
+  requestAnimationFrame(() => {
+    vid.srcObject = freshStream;
+    vid.muted = false;
+    vid.volume = 1.0;
+    safePlay(vid);
+  });
 
   if (newTrack?.kind === 'video' || stream.getVideoTracks().length > 0) {
     const ph = tile.querySelector('.no-video-placeholder');
     if (ph) ph.classList.add('hidden');
   }
 
-  // Also refresh focus overlay if this peer is focused — force full re-attach
+  // Also refresh focus overlay if this peer is focused
   const fv = focusVideo();
   if (focusedPeer === socketId && fv) {
     fv.pause();
     fv.srcObject = null;
-    setTimeout(() => {
+    requestAnimationFrame(() => {
       const s2 = peerStreams[socketId];
       if (!s2) return;
       const ms2 = new MediaStream();
       s2.getTracks().forEach(t => ms2.addTrack(t));
       fv.srcObject = ms2;
-      fv.muted = false; fv.volume = 1.0;
+      fv.muted = false;
+      fv.volume = 1.0;
       safePlay(fv);
-    }, 60);
+    });
   }
 }
 
@@ -673,7 +685,10 @@ function addRemoteTile(socketId, stream) {
   const vid = tile.querySelector('video');
   vid.volume = 1.0;
   if (stream?.getTracks().length > 0) {
-    vid.srcObject = stream;
+    // Fresh MediaStream on initial attach too — consistent with refresh pattern
+    const initStream = new MediaStream();
+    stream.getTracks().forEach(t => initStream.addTrack(t));
+    vid.srcObject = initStream;
     safePlay(vid);
     if (stream.getVideoTracks().length > 0) {
       tile.querySelector('.no-video-placeholder').classList.add('hidden');
@@ -843,15 +858,18 @@ setInterval(() => {
     if (!tile) return;
     const vid = tile.querySelector('video');
     if (!vid) return;
-    if (!vid.srcObject) {
-      vid.srcObject = stream; safePlay(vid);
-    } else if (vid.readyState === 0 && stream.getVideoTracks().length > 0) {
-      vid.srcObject = null; vid.srcObject = stream; safePlay(vid);
+    const needsRefresh = !vid.srcObject || (vid.readyState === 0 && stream.getVideoTracks().length > 0);
+    if (needsRefresh) {
+      const hs = new MediaStream(); stream.getTracks().forEach(t => hs.addTrack(t));
+      vid.pause(); vid.srcObject = null;
+      requestAnimationFrame(() => { vid.srcObject = hs; safePlay(vid); });
     }
     const fv = focusVideo();
     if (focusedPeer === socketId && fv) {
       if (!fv.srcObject || fv.readyState === 0) {
-        fv.srcObject = null; fv.srcObject = stream; safePlay(fv);
+        const hf = new MediaStream(); stream.getTracks().forEach(t => hf.addTrack(t));
+        fv.pause(); fv.srcObject = null;
+        requestAnimationFrame(() => { fv.srcObject = hf; fv.muted = false; fv.volume = 1.0; safePlay(fv); });
       }
     }
   });
