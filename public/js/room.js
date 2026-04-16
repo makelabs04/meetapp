@@ -807,98 +807,11 @@ function toggleLocalTile() {
 
 // ── safePlay ──────────────────────────────────────────────────
 function safePlay(videoEl) {
-  if (!videoEl) return;
   const p = videoEl.play();
   if (p) p.catch(err => {
     if (err.name === 'NotAllowedError') document.getElementById('audio-banner')?.classList.remove('hidden');
-    else if (err.name === 'AbortError') {
-      // Mobile browsers abort play() when tab goes to background — retry shortly
-      setTimeout(() => {
-        if (videoEl.srcObject && videoEl.paused) videoEl.play().catch(() => {});
-      }, 500);
-    }
   });
 }
-
-// ── Mobile: force-rebind every video after returning from background ───────────
-// Mobile OSes (iOS, Android) suspend WebRTC video decoders when the browser
-// tab is backgrounded or the screen locks. On return the video element stays
-// black even though the RTP stream is still flowing. A null→reassign of
-// srcObject forces the browser to re-attach the decoder to the live track.
-function rebindAllVideos() {
-  console.log('[mobile] rebindAllVideos');
-  Object.keys(peerStreams).forEach(socketId => {
-    const stream = peerStreams[socketId];
-    if (!stream) return;
-    const tile = document.getElementById(`tile-${socketId}`);
-    const vid  = tile?.querySelector('video');
-    if (vid) {
-      const src = vid.srcObject || stream;
-      vid.srcObject = null;
-      vid.srcObject = src;
-      safePlay(vid);
-    }
-  });
-  // Focus overlay
-  if (focusedPeer) {
-    const fv = focusVideo();
-    if (fv) {
-      const src = fv.srcObject || peerStreams[focusedPeer];
-      if (src) { fv.srcObject = null; fv.srcObject = src; safePlay(fv); }
-    }
-  }
-  // Local video (may also pause after background)
-  const lv = localVideo();
-  if (lv && localStream) {
-    if (!lv.srcObject) lv.srcObject = localStream;
-    if (lv.paused) lv.play().catch(() => {});
-  }
-}
-
-// ── Mobile: Page Visibility API ───────────────────────────────
-// Tab switch / screen lock → decoders suspended → must rebind on return
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') {
-    setTimeout(rebindAllVideos, 400);   // first pass: fast devices
-    setTimeout(rebindAllVideos, 1500);  // second pass: slow devices
-  }
-});
-
-// ── Mobile: Page Lifecycle freeze/resume (Chrome Android) ─────
-window.addEventListener('resume', () => setTimeout(rebindAllVideos, 400));
-
-// ── Mobile: bfcache restore (Safari iOS) ─────────────────────
-window.addEventListener('pageshow', e => {
-  if (e.persisted) setTimeout(rebindAllVideos, 400);
-});
-
-// ── Mobile: Screen Wake Lock ──────────────────────────────────
-// Prevents the screen from turning off while watching a shared screen.
-// The OS would suspend the video decoder, causing permanent black frames.
-let wakeLock = null;
-async function requestWakeLock() {
-  if (!('wakeLock' in navigator)) return;
-  try {
-    wakeLock = await navigator.wakeLock.request('screen');
-    wakeLock.addEventListener('release', () => { wakeLock = null; });
-    console.log('[mobile] wake lock acquired');
-  } catch (err) {
-    console.warn('[mobile] wake lock failed:', err.message);
-  }
-}
-// Re-acquire after OS releases it (happens on every visibility change)
-document.addEventListener('visibilitychange', async () => {
-  if (document.visibilityState === 'visible' && !wakeLock) requestWakeLock();
-});
-function acquireWakeLockForScreenShare() { requestWakeLock(); }
-
-// ── Mobile: tap-to-recover stalled videos (iOS fallback) ──────
-// iOS Safari requires a user gesture to resume suspended video playback.
-document.addEventListener('touchend', () => {
-  document.querySelectorAll('video').forEach(v => {
-    if (v.paused && v.srcObject) v.play().catch(() => {});
-  });
-}, { passive: true });
 
 // ── FIX: Draggable PiP panel ──────────────────────────────────
 function initDraggablePip() {
@@ -975,8 +888,6 @@ function initDraggablePip() {
 
 // ── Periodic health-check ─────────────────────────────────────
 // Catches black screens caused by stalled decoders or detached srcObjects.
-// Runs every 2 s. Also detects readyState===0 (HAVE_NOTHING) which is the
-// signature of a mobile decoder being silently detached after backgrounding.
 setInterval(() => {
   Object.keys(peerStreams).forEach(socketId => {
     const stream = peerStreams[socketId];
@@ -986,14 +897,14 @@ setInterval(() => {
     const vid = tile.querySelector('video');
     if (!vid) return;
 
-    const hasLiveVideo = stream.getVideoTracks().some(t => t.readyState === 'live');
     const needsRefresh =
       !vid.srcObject ||
-      vid.readyState === 0 ||                          // HAVE_NOTHING — mobile decoder detached
-      (vid.readyState < 2 && hasLiveVideo) ||
+      (vid.readyState < 2 && stream.getVideoTracks().some(t => t.readyState === 'live')) ||
       vid.paused;
 
     if (needsRefresh) {
+      // FIX: preserve whatever srcObject is currently bound (may be a live screen-share
+      // stream from replaceTrack). Only fall back to peerStreams cache if nothing is bound.
       const src = vid.srcObject || stream;
       console.log(`[health] refreshing stalled video for ${socketId} readyState=${vid.readyState} paused=${vid.paused}`);
       vid.srcObject = null;
@@ -1005,12 +916,12 @@ setInterval(() => {
     const fv = focusVideo();
     if (focusedPeer === socketId && fv) {
       const fvSrc = fv.srcObject || stream;
-      if (!fv.srcObject || fv.readyState === 0 || fv.readyState < 2 || fv.paused) {
+      if (!fv.srcObject || fv.readyState < 2 || fv.paused) {
         fv.srcObject = null; fv.srcObject = fvSrc; safePlay(fv);
       }
     }
   });
-}, 2000);
+}, 3000);
 
 // ── Grid ──────────────────────────────────────────────────────
 function updateGridLayout() {
@@ -1080,9 +991,6 @@ async function startScreenShare() {
 
   // Improve encoding quality for screen content
   screenTrack.contentHint = 'detail';
-
-  // Keep the screen on while sharing — prevents OS from suspending the encoder
-  acquireWakeLockForScreenShare();
 
   // Wait for the screen track to actually produce its FIRST FRAME before sending.
   // The unmute event fires too early on many browsers — the track is 'live' but
