@@ -281,8 +281,21 @@ socket.on('peer-media-state', ({ socketId, video, audio, screen }) => {
       label.textContent = '🖥 Presenting';
       tile.appendChild(label);
     }
-    // Small delay to let the video track settle before opening focus overlay
-    setTimeout(() => openFocusOverlay(socketId), 300);
+    // Wait for the incoming video track to carry live frames before opening
+    // the focus overlay. Poll until the video element is actually playing.
+    const stream = peerStreams[socketId];
+    const vid = tile.querySelector('video');
+    let attempts = 0;
+    const tryOpen = () => {
+      attempts++;
+      const hasLiveVideo = stream && stream.getVideoTracks().some(t => t.readyState === 'live');
+      if ((vid && vid.readyState >= 2) || hasLiveVideo || attempts >= 10) {
+        openFocusOverlay(socketId);
+      } else {
+        setTimeout(tryOpen, 300);
+      }
+    };
+    setTimeout(tryOpen, 300);
   } else {
     tile.classList.remove('screenshare-tile');
     if (label) label.remove();
@@ -500,16 +513,21 @@ async function createPeer(socketId, initiator) {
   const pc = new RTCPeerConnection(ICE_SERVERS);
   peers[socketId] = pc;
 
+  // Add local camera/mic tracks first
   if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
-  // FIX: when screen sharing is active, replace the video sender track with the screen track
-  // This ensures new peers receive the screen share, not a blank/camera track
+  // If screen sharing is active, replace the video sender with the live screen track.
+  // We must do this AFTER addTrack so a video sender already exists.
   if (isScreenSharing && screenStream) {
-    const screenTrack = screenStream.getVideoTracks()[0];
+    const screenTrack = screenStream.getVideoTracks().find(t => t.readyState === 'live');
     if (screenTrack) {
       const videoSender = pc.getSenders().find(s => s.track?.kind === 'video');
       if (videoSender) {
-        videoSender.replaceTrack(screenTrack).catch(() => {});
+        // replaceTrack is synchronous from the sender perspective but async with the browser.
+        // Awaiting here ensures the offer/answer SDP reflects the actual track being sent.
+        await videoSender.replaceTrack(screenTrack).catch(e =>
+          console.warn('[createPeer] replaceTrack for screen:', e.message)
+        );
       } else {
         pc.addTrack(screenTrack, screenStream);
       }
@@ -520,19 +538,27 @@ async function createPeer(socketId, initiator) {
     if (candidate) socket.emit('ice-candidate', { to: socketId, from: socket.id, candidate });
   };
 
+  // ICE connection state for transport-level failures
+  pc.oniceconnectionstatechange = () => {
+    console.log(`[peer ${socketId}] ice: ${pc.iceConnectionState}`);
+    if (pc.iceConnectionState === 'failed') {
+      console.warn(`[peer ${socketId}] ICE failed — attempting restart`);
+      pc.restartIce();
+    }
+  };
+
   pc.onconnectionstatechange = () => {
     console.log(`[peer ${socketId}] conn: ${pc.connectionState}`);
-    // FIX: only remove on 'failed' or 'closed', NOT on 'disconnected'
-    // 'disconnected' is transient (network hiccup); removing on it causes ghost tiles
     if (['failed','closed'].includes(pc.connectionState)) removePeer(socketId);
   };
 
   peerStreams[socketId] = new MediaStream();
 
-  pc.ontrack = ({ track }) => {
-    console.log(`[peer ${socketId}] ontrack ${track.kind} id=${track.id}`);
+  pc.ontrack = ({ track, streams }) => {
+    console.log(`[peer ${socketId}] ontrack ${track.kind} id=${track.id} readyState=${track.readyState}`);
     const stream = peerStreams[socketId];
 
+    // Replace any existing track of the same kind to avoid duplicates
     stream.getTracks().filter(t => t.kind === track.kind).forEach(t => stream.removeTrack(t));
     stream.addTrack(track);
     if (track.kind === 'audio') track.enabled = true;
@@ -555,7 +581,8 @@ async function createPeer(socketId, initiator) {
   return pc;
 }
 
-// FIX: null → reassign forces browser to re-render with new/replaced track
+// Reassigning srcObject (null → stream) forces the browser to re-bind the
+// MediaStream and begin decoding the new/replaced track, clearing black frames.
 function refreshTileVideo(socketId, stream, newTrack) {
   // Don't create/refresh tiles for peers that are no longer tracked
   if (!peers[socketId] && !peerNames[socketId]) return;
@@ -564,17 +591,20 @@ function refreshTileVideo(socketId, stream, newTrack) {
   const vid = tile.querySelector('video');
   if (!vid) return;
 
+  // Force re-bind so the browser flushes the stale (black) decoded frame buffer
   vid.srcObject = null;
   vid.srcObject = stream;
   vid.muted = false; vid.volume = 1.0;
   safePlay(vid);
 
-  if (newTrack?.kind === 'video' || stream.getVideoTracks().length > 0) {
+  // Hide placeholder once we have an active video track
+  const hasVideo = stream.getVideoTracks().some(t => t.readyState === 'live' && t.enabled);
+  if (hasVideo || newTrack?.kind === 'video') {
     const ph = tile.querySelector('.no-video-placeholder');
     if (ph) ph.classList.add('hidden');
   }
 
-  // Also refresh focus overlay if this peer is focused
+  // Refresh focus overlay too if this peer is currently focused
   const fv = focusVideo();
   if (focusedPeer === socketId && fv) {
     fv.srcObject = null;
@@ -674,6 +704,7 @@ function openFocusOverlay(socketId) {
   focusName().textContent = name + ' — Screen Share';
 
   const fv = focusVideo();
+  // Force null → reassign to flush any stale/black buffered frame
   fv.srcObject = null;
   fv.srcObject = stream;
   fv.muted = false; fv.volume = 1.0;
@@ -797,6 +828,7 @@ function initDraggablePip() {
 }
 
 // ── Periodic health-check ─────────────────────────────────────
+// Catches black screens caused by stalled decoders or detached srcObjects.
 setInterval(() => {
   Object.keys(peerStreams).forEach(socketId => {
     const stream = peerStreams[socketId];
@@ -805,19 +837,28 @@ setInterval(() => {
     if (!tile) return;
     const vid = tile.querySelector('video');
     if (!vid) return;
-    if (!vid.srcObject) {
-      vid.srcObject = stream; safePlay(vid);
-    } else if (vid.readyState === 0 && stream.getVideoTracks().length > 0) {
-      vid.srcObject = null; vid.srcObject = stream; safePlay(vid);
+
+    const needsRefresh =
+      !vid.srcObject ||
+      (vid.readyState < 2 && stream.getVideoTracks().some(t => t.readyState === 'live')) ||
+      vid.paused;
+
+    if (needsRefresh) {
+      console.log(`[health] refreshing stalled video for ${socketId} readyState=${vid.readyState} paused=${vid.paused}`);
+      vid.srcObject = null;
+      vid.srcObject = stream;
+      safePlay(vid);
     }
+
+    // Also keep the focus overlay in sync
     const fv = focusVideo();
     if (focusedPeer === socketId && fv) {
-      if (!fv.srcObject || fv.readyState === 0) {
+      if (!fv.srcObject || fv.readyState < 2 || fv.paused) {
         fv.srcObject = null; fv.srcObject = stream; safePlay(fv);
       }
     }
   });
-}, 4000);
+}, 3000);
 
 // ── Grid ──────────────────────────────────────────────────────
 function updateGridLayout() {
@@ -885,26 +926,43 @@ async function startScreenShare() {
   screenMinimized = false;
   const screenTrack = screenStream.getVideoTracks()[0];
 
+  // Wait for the screen track to become live before sending to peers.
+  // This is the primary cause of black screens: the track isn't producing
+  // frames yet when replaceTrack() is called, so receivers get a black frame.
+  await new Promise(resolve => {
+    if (screenTrack.readyState === 'live') { resolve(); return; }
+    screenTrack.addEventListener('unmute', resolve, { once: true });
+    // Safety fallback — resolve after 500 ms even if event never fires
+    setTimeout(resolve, 500);
+  });
+
+  // Replace video track on every existing peer connection
   await Promise.allSettled(Object.keys(peers).map(async sid => {
     const pc = peers[sid];
+    if (pc.connectionState === 'failed' || pc.connectionState === 'closed') return;
     const vs = pc.getSenders().find(s => s.track?.kind === 'video');
     if (vs) {
       try { await vs.replaceTrack(screenTrack); }
-      catch { pc.addTrack(screenTrack, screenStream); }
+      catch (e) {
+        console.warn(`[screen] replaceTrack failed for ${sid}, adding instead:`, e.message);
+        pc.addTrack(screenTrack, screenStream);
+      }
     } else {
       pc.addTrack(screenTrack, screenStream);
     }
   }));
 
+  // Show PiP preview of own screen
   const spv = screenPreviewVid();
   spv.srcObject = screenStream; spv.muted = true; spv.play().catch(()=>{});
 
-  // FIX: reset PiP position to default (top-right, away from chat)
+  // Reset PiP position away from chat panel
   const pip = screenPreview();
   pip.style.left = ''; pip.style.top = '';
   pip.style.right = '20px'; pip.style.bottom = 'calc(var(--ctrl-bar) + 16px)';
   pip.classList.remove('hidden', 'minimized');
 
+  // Show screen track in local tile (mirroring disabled for screen content)
   const lv = localVideo();
   lv.srcObject = screenStream; lv.muted = true; lv.style.transform = 'none';
   localPlaceholder().classList.add('hidden');
@@ -925,6 +983,8 @@ async function startScreenShare() {
   document.getElementById('screen-banner').classList.remove('hidden');
 
   socket.emit('media-state', { roomId: ROOM_ID, video: camEnabled, audio: micEnabled, screen: true });
+
+  // Handle user clicking browser's "Stop sharing" button
   screenTrack.onended = () => stopScreenShare();
   showToast('Screen sharing started');
 }
@@ -935,11 +995,20 @@ function stopScreenShare() {
 
   if (screenStream) { screenStream.getTracks().forEach(t => t.stop()); screenStream = null; }
 
-  const camTrack = localStream?.getVideoTracks()[0] || null;
+  // Restore camera track on all peers (null replaceTrack sends black — use a live track or remove)
+  const camTrack = localStream?.getVideoTracks().find(t => t.readyState === 'live') || null;
   Object.keys(peers).forEach(sid => {
     const pc = peers[sid];
+    if (pc.connectionState === 'failed' || pc.connectionState === 'closed') return;
     const vs = pc.getSenders().find(s => s.track?.kind === 'video');
-    if (vs) vs.replaceTrack(camTrack).catch(()=>{});
+    if (!vs) return;
+    if (camTrack) {
+      vs.replaceTrack(camTrack).catch(e => console.warn(`[screen stop] replaceTrack ${sid}:`, e.message));
+    } else {
+      // Camera was never available — replace with null to send silence/black
+      // but don't crash; some browsers reject null replaceTrack
+      vs.replaceTrack(null).catch(() => {});
+    }
   });
 
   const lv = localVideo();
