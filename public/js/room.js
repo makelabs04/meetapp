@@ -263,21 +263,26 @@ socket.on('chat-message', ({ userName, message, socketId: sid }) => {
 // The receiver's <video> keeps decoding the old (black) stream unless we explicitly
 // force a srcObject rebind. These two events trigger that rebind.
 socket.on('peer-screen-share-started', ({ socketId }) => {
-  const stream = peerStreams[socketId];
-  if (!stream) return;
-  const tile = document.getElementById(`tile-${socketId}`);
-  const vid  = tile?.querySelector('video');
-  let attempts = 0;
-  const tryRebind = () => {
-    attempts++;
+  // peer-media-state arrives first (opens focus overlay with stale/black video),
+  // then this event arrives. We must rebind BOTH the tile video AND the focus overlay.
+  const rebindAll = () => {
+    const stream = peerStreams[socketId];
+    if (!stream) return;
+    const tile = document.getElementById(`tile-${socketId}`);
+    const vid  = tile?.querySelector('video');
     if (vid) { vid.srcObject = null; vid.srcObject = stream; safePlay(vid); }
-    const hasFrames = vid && vid.readyState >= 2;
-    const hasLive   = stream.getVideoTracks().some(t => t.readyState === 'live');
-    if (!hasFrames && hasLive && attempts < 15) {
-      setTimeout(tryRebind, 300);
+    // Always refresh focus overlay — it may have been opened by peer-media-state already
+    const fv = focusVideo();
+    if (fv) { fv.srcObject = null; fv.srcObject = stream; fv.muted = false; fv.volume = 1.0; safePlay(fv); }
+    // If focus overlay isn't open yet, open it now with the live stream
+    if (!focusedPeer || focusedPeer !== socketId) {
+      openFocusOverlay(socketId);
     }
   };
-  setTimeout(tryRebind, 300);
+  // Run immediately and again after short delays to catch slow decoders
+  setTimeout(rebindAll, 100);
+  setTimeout(rebindAll, 500);
+  setTimeout(rebindAll, 1200);
 });
 
 socket.on('peer-screen-share-stopped', ({ socketId }) => {
@@ -314,21 +319,8 @@ socket.on('peer-media-state', ({ socketId, video, audio, screen }) => {
       label.textContent = '🖥 Presenting';
       tile.appendChild(label);
     }
-    // Wait for the incoming video track to carry live frames before opening
-    // the focus overlay. Poll until the video element is actually playing.
-    const stream = peerStreams[socketId];
-    const vid = tile.querySelector('video');
-    let attempts = 0;
-    const tryOpen = () => {
-      attempts++;
-      const hasLiveVideo = stream && stream.getVideoTracks().some(t => t.readyState === 'live');
-      if ((vid && vid.readyState >= 2) || hasLiveVideo || attempts >= 10) {
-        openFocusOverlay(socketId);
-      } else {
-        setTimeout(tryOpen, 300);
-      }
-    };
-    setTimeout(tryOpen, 300);
+    // Do NOT open the focus overlay here — video is not bound yet at this point.
+    // peer-screen-share-started fires next and handles the rebind + overlay open.
   } else {
     tile.classList.remove('screenshare-tile');
     if (label) label.remove();
@@ -747,13 +739,28 @@ function openFocusOverlay(socketId) {
   focusName().textContent = name + ' — Screen Share';
 
   const fv = focusVideo();
-  // Force null → reassign to flush any stale/black buffered frame
   fv.srcObject = null;
   fv.srcObject = stream;
   fv.muted = false; fv.volume = 1.0;
   safePlay(fv);
 
   focusOverlay().classList.remove('hidden');
+
+  // Deferred rebind: if the decoder hasn't produced frames yet, force another
+  // srcObject flush after a short delay. This fixes the "black fullscreen" case
+  // where the overlay opens before the first keyframe arrives.
+  const rebind = () => {
+    if (focusedPeer !== socketId) return; // user closed overlay already
+    const fv2 = focusVideo();
+    if (!fv2) return;
+    if (fv2.readyState < 2) {
+      fv2.srcObject = null;
+      fv2.srcObject = peerStreams[socketId] || stream;
+      safePlay(fv2);
+    }
+  };
+  setTimeout(rebind, 400);
+  setTimeout(rebind, 1000);
 }
 
 function closeFocusOverlay() {
